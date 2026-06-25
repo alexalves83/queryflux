@@ -20,10 +20,7 @@ use queryflux_frontend::{
     flight_sql::FlightSqlFrontend,
     mysql_wire::MysqlWireFrontend,
     postgres_wire::PostgresWireFrontend,
-    snowflake::{
-        http::session_store::{SnowflakeHttpSessionPolicy, SnowflakeSessionStore},
-        SnowflakeFrontend,
-    },
+    snowflake::SnowflakeFrontend,
     state::LiveConfig,
     trino_http::{state::AppState, TrinoHttpFrontend},
     FrontendListenerTrait,
@@ -40,8 +37,8 @@ use queryflux_metrics::{
 };
 use queryflux_persistence::cluster_config::{UpsertClusterConfig, UpsertClusterGroupConfig};
 use queryflux_persistence::{
-    in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, ClusterConfigStore,
-    ProxySettingsStore, RoutingConfigStore, KIND_GUARD,
+    in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, BackendStore,
+    DistributedBackendStore, KIND_GUARD,
 };
 use queryflux_routing::{
     chain::RouterChain,
@@ -65,20 +62,61 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "queryflux=info,queryflux_frontend=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
 
-    info!("QueryFlux starting — loading config from: {}", cli.config);
+    // Load config before initializing the tracing subscriber so that
+    // `otlpEndpoint` from the config file can feed the OTel layer.
     let mut config = YamlFileConfigProvider::new(&cli.config)
         .load()
         .await
         .context("Failed to load config")?;
+
+    // Initialize tracing subscriber — with OTel if configured.
+    {
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "queryflux=info,queryflux_frontend=info".into());
+
+        #[cfg(feature = "otlp")]
+        {
+            if let Some(endpoint) = &config.queryflux.otlp_endpoint {
+                use opentelemetry::trace::TracerProvider;
+                use opentelemetry_otlp::WithExportConfig;
+                use tracing_subscriber::layer::SubscriberExt;
+                use tracing_subscriber::util::SubscriberInitExt;
+
+                let exporter = opentelemetry_otlp::SpanExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(endpoint)
+                    .build()
+                    .expect("Failed to create OTLP exporter");
+                let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .with_batch_exporter(exporter)
+                    .with_resource(
+                        opentelemetry_sdk::Resource::builder()
+                            .with_service_name("queryflux")
+                            .build(),
+                    )
+                    .build();
+                let telemetry =
+                    tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("queryflux"));
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(tracing_subscriber::fmt::layer())
+                    .with(telemetry)
+                    .init();
+                tracing::info!(endpoint = %endpoint, "OpenTelemetry OTLP tracing enabled");
+            } else {
+                tracing_subscriber::fmt().with_env_filter(env_filter).init();
+            }
+        }
+
+        #[cfg(not(feature = "otlp"))]
+        {
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        }
+    }
+
+    info!("QueryFlux starting — loaded config from: {}", cli.config);
 
     let external_address = config
         .queryflux
@@ -108,9 +146,14 @@ async fn main() -> Result<()> {
                 .connection_url()
                 .map_err(|m| anyhow::anyhow!("Invalid postgres persistence config: {m}"))?;
             let pg = Arc::new(
-                PostgresStore::connect(&url)
-                    .await
-                    .context("Failed to connect to Postgres")?,
+                PostgresStore::connect_with_pool_opts(
+                    &url,
+                    conn.pool_size,
+                    conn.acquire_timeout_secs,
+                    conn.statement_timeout_secs,
+                )
+                .await
+                .context("Failed to connect to Postgres")?,
             );
             pg.migrate().await.context("Migration failed")?;
             let buffered = Arc::new(BufferedMetricsStore::new(
@@ -138,6 +181,15 @@ async fn main() -> Result<()> {
         }
     };
 
+    // The durable backend behind the proxy, type-erased so that everything south
+    // of this point is wired against traits. A future backend (e.g. Redis) only
+    // needs to implement `BackendStore` and be constructed in the match above.
+    // `None` in in-memory mode, which intentionally has no durable config source.
+    let backend: Option<Arc<dyn BackendStore>> = pg_store.clone().map(|pg| pg as _);
+    // Multi-replica coordination is optional: only backends that also implement
+    // `DistributedBackendStore` (Postgres today) are stored here.
+    let distributed_backend: Option<Arc<dyn DistributedBackendStore>> = pg_store.map(|pg| pg as _);
+
     // Filled when Postgres loads cluster/group rows — used for query_history FKs on ClusterState.
     let mut cluster_ids_by_name: HashMap<String, i64> = HashMap::new();
     let mut group_ids_by_name: HashMap<String, i64> = HashMap::new();
@@ -152,7 +204,7 @@ async fn main() -> Result<()> {
     // configs authoritative even if the volume already had older rows (e.g. switched engine).
     // **Studio-first** setups omit those maps (or leave them empty) — then nothing is written
     // here and the DB remains the source of truth for those resources.
-    if let Some(pg) = &pg_store {
+    if let Some(pg) = &backend {
         if !config.clusters.is_empty() {
             info!("Applying cluster definitions from YAML to Postgres");
             for (name, cfg) in &config.clusters {
@@ -254,20 +306,11 @@ async fn main() -> Result<()> {
 
         // Apply persisted security overrides (`security_settings` / `security_config` key).
         if let Ok(Some(v)) = pg.get_proxy_setting("security_config").await {
-            if let Ok(auth_cfg) = serde_json::from_value::<queryflux_core::config::AuthConfig>(
-                v.get("authConfig")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            ) {
+            let (auth_cfg, authz_cfg) = parse_security_setting(&v);
+            if let Some(auth_cfg) = auth_cfg {
                 config.auth = auth_cfg;
             }
-            if let Ok(authz_cfg) =
-                serde_json::from_value::<queryflux_core::config::AuthorizationConfig>(
-                    v.get("authorizationConfig")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                )
-            {
+            if let Some(authz_cfg) = authz_cfg {
                 config.authorization = authz_cfg;
             }
         }
@@ -475,6 +518,7 @@ async fn main() -> Result<()> {
         group_order.push(group_name.clone());
         group_states.insert(group_key, (states, strategy));
     }
+    group_order.sort();
 
     let health_check_targets = health_targets_from_groups(&group_states, &adapters);
     let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
@@ -570,78 +614,37 @@ async fn main() -> Result<()> {
 
     let router_chain = RouterChain::new(routers, fallback);
 
-    // --- Build auth provider from config ---
-    use queryflux_core::config::AuthProviderConfig;
-    let auth_required = config.auth.required;
-    let auth_provider: Arc<dyn queryflux_auth::AuthProvider> = match &config.auth.provider {
-        AuthProviderConfig::None => {
-            info!("Auth provider: none (network-trust only)");
-            Arc::new(NoneAuthProvider::new(auth_required))
-        }
-        AuthProviderConfig::Static => {
-            let users = config
-                .auth
-                .static_users
-                .as_ref()
-                .context("auth.provider = static requires auth.staticUsers to be configured")?
-                .users
-                .clone();
-            info!(user_count = users.len(), "Auth provider: static");
-            Arc::new(StaticAuthProvider::new(users, auth_required))
-        }
-        AuthProviderConfig::Oidc => {
-            let oidc_cfg = config
-                .auth
-                .oidc
-                .clone()
-                .context("auth.provider = oidc requires auth.oidc to be configured")?;
-            info!(issuer = %oidc_cfg.issuer, "Auth provider: OIDC");
-            Arc::new(OidcAuthProvider::new(oidc_cfg, auth_required))
-        }
-        AuthProviderConfig::Ldap => {
-            let ldap_cfg = config
-                .auth
-                .ldap
-                .clone()
-                .context("auth.provider = ldap requires auth.ldap to be configured")?;
-            info!(url = %ldap_cfg.url, "Auth provider: LDAP");
-            Arc::new(LdapAuthProvider::new(ldap_cfg, auth_required))
-        }
-    };
-    // --- Build authorization checker from config ---
-    use queryflux_core::config::AuthorizationProviderConfig;
-    let authorization: Arc<dyn queryflux_auth::AuthorizationChecker> = match &config
-        .authorization
-        .provider
+    let auth_provider = build_auth_provider(&config.auth)?;
+    let authorization = build_authorization(&config.authorization, &config.cluster_groups)?;
+
+    // --- Production safety warnings ---
+    if matches!(
+        config.auth.provider,
+        queryflux_core::config::AuthProviderConfig::None
+    ) {
+        tracing::warn!(
+            "SECURITY: auth.provider is 'none' — all query frontends accept unauthenticated traffic. \
+             Set auth.provider to 'oidc', 'ldap', or 'static' and auth.required = true for production."
+        );
+    }
+    if !config.auth.required {
+        tracing::warn!(
+            "SECURITY: auth.required is false — unauthenticated requests are allowed even when \
+             an auth provider is configured. Set auth.required = true for production."
+        );
+    }
     {
-        AuthorizationProviderConfig::None => {
-            // Build per-group allow-lists from cluster group configs.
-            // Groups with empty lists are open (allow-all), preserving backward compat.
-            let policies = config
-                .cluster_groups
-                .iter()
-                .map(|(name, cfg)| (name.clone(), cfg.authorization.clone()))
-                .collect();
-            let has_any_policy = config.cluster_groups.values().any(|cfg| {
-                !cfg.authorization.allow_groups.is_empty()
-                    || !cfg.authorization.allow_users.is_empty()
-            });
-            if has_any_policy {
-                info!("Authorization: simple allow-list policy");
-                Arc::new(SimpleAuthorizationPolicy::new(policies))
-            } else {
-                info!("Authorization: allow-all (no allow-lists configured)");
-                Arc::new(AllowAllAuthorization)
-            }
+        let effective_user = std::env::var("QUERYFLUX_ADMIN_USER")
+            .unwrap_or_else(|_| config.queryflux.admin_api.username.clone());
+        let effective_pass = std::env::var("QUERYFLUX_ADMIN_PASSWORD")
+            .unwrap_or_else(|_| config.queryflux.admin_api.password.clone());
+        if effective_user == "admin" && effective_pass == "admin" {
+            tracing::warn!(
+                "SECURITY: admin API is using default credentials (admin/admin). \
+                 Change via QUERYFLUX_ADMIN_USER / QUERYFLUX_ADMIN_PASSWORD or the Studio UI."
+            );
         }
-        AuthorizationProviderConfig::OpenFga => {
-            let openfga_cfg = config.authorization.openfga.clone().context(
-                "authorization.provider = openfga requires authorization.openfga to be configured",
-            )?;
-            info!(url = %openfga_cfg.url, store_id = %openfga_cfg.store_id, "Authorization: OpenFGA");
-            Arc::new(OpenFgaAuthorizationClient::new(openfga_cfg))
-        }
-    };
+    }
 
     // --- Startup validation: impersonate only valid for Trino ---
     for (name, cfg) in &config.clusters {
@@ -665,33 +668,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    // --- Snowflake HTTP: sessions are in-memory on this process only ---
-    if let Some(sf) = config.queryflux.frontends.snowflake_http.as_ref() {
-        if sf.enabled {
-            if config.queryflux.enforce_snowflake_http_session_affinity
-                && !sf.session_affinity_acknowledged
-            {
-                anyhow::bail!(
-                    "Snowflake HTTP is enabled and queryflux.enforceSnowflakeHttpSessionAffinity is true, \
-                     but frontends.snowflakeHttp.sessionAffinityAcknowledged is false. \
-                     Wire sessions live in process memory; configure your load balancer for session affinity \
-                     to the same QueryFlux replica for all requests that reuse the Snowflake login token \
-                     (e.g. consistent hash on the Authorization header), then set sessionAffinityAcknowledged: true. \
-                     For a single-replica deployment, omit enforceSnowflakeHttpSessionAffinity."
-                );
-            }
-            tracing::info!(
-                "Snowflake HTTP frontend: login sessions are stored in this process only; \
-                 multi-replica setups require load balancer session affinity to the same instance per client token. \
-                 Set queryflux.enforceSnowflakeHttpSessionAffinity: true with sessionAffinityAcknowledged: true after configuring routing."
-            );
-        }
-    }
-
     let identity_resolver = Arc::new(BackendIdentityResolver::new());
     let cluster_configs = config.clusters.clone();
 
-    let group_translation_scripts: HashMap<String, Vec<String>> = if let Some(pg) = &pg_store {
+    let group_translation_scripts: HashMap<String, Vec<String>> = if let Some(pg) = &backend {
         pg.load_group_translation_bodies()
             .await
             .unwrap_or_else(|e| {
@@ -701,12 +681,13 @@ async fn main() -> Result<()> {
     } else {
         HashMap::new()
     };
-    let guard_script_bodies = load_guard_script_bodies(pg_store.as_deref()).await;
+    let guard_script_bodies =
+        load_guard_script_bodies(backend.as_deref().map(|b| b as &dyn AdminStore)).await;
 
     // --- Build guard chains: DB-stored config (UI-managed) takes precedence over YAML ---
     // When a persisted config exists in Postgres it is authoritative, even if it
     // resolves to an empty chain (the user may have intentionally cleared guards).
-    let (guard_chain, group_guard_chains) = if let Some(pg) = &pg_store {
+    let (guard_chain, group_guard_chains) = if let Some(pg) = &backend {
         match pg.get_proxy_setting("guardrails_config").await {
             Ok(Some(v)) => build_guard_chains_from_db_value(&v, &guard_script_bodies),
             _ => build_guard_chains(&config, &guard_script_bodies),
@@ -714,6 +695,25 @@ async fn main() -> Result<()> {
     } else {
         build_guard_chains(&config, &guard_script_bodies)
     };
+
+    // --- Startup validation: referential integrity of routing → groups → adapters ---
+    {
+        let issues = validate_live_config_refs(
+            &config.routers,
+            &config.routing_fallback,
+            &group_members,
+            &adapters,
+        );
+        if !issues.is_empty() {
+            for issue in &issues {
+                tracing::error!("Config validation: {issue}");
+            }
+            anyhow::bail!(
+                "Startup config has {} referential integrity error(s) — aborting",
+                issues.len()
+            );
+        }
+    }
 
     // --- Wrap hot-reloadable fields in LiveConfig ---
     let group_default_tags: HashMap<String, queryflux_core::tags::QueryTags> = config
@@ -734,6 +734,8 @@ async fn main() -> Result<()> {
         group_order,
         group_translation_scripts,
         group_default_tags,
+        auth_provider,
+        authorization,
     };
     // Seed the reload cache. When Postgres is active, fingerprint `engine_key` + JSONB config
     // (same format as `build_live_config` on reload) so an engine change rebuilds adapters even
@@ -781,31 +783,80 @@ async fn main() -> Result<()> {
     }));
     let live = Arc::new(tokio::sync::RwLock::new(live_config));
 
-    let snowflake_session_policy = config
-        .queryflux
-        .frontends
-        .snowflake_http
-        .as_ref()
-        .map(SnowflakeHttpSessionPolicy::from_frontend_config)
-        .unwrap_or_default();
+    // Replica identity for capacity leases and queue claims. Must be unique per
+    // *process incarnation*: PIDs collide across containers (the main process is
+    // PID 1 in most pods), and a bare hostname survives container restarts —
+    // either would make this replica's heartbeat renew leases that belong to a
+    // dead instance, so they would never expire. Hostname (= pod name in
+    // Kubernetes) is included purely for debuggability; the random nonce is what
+    // guarantees uniqueness.
+    let instance_id = std::env::var("QUERYFLUX_INSTANCE_ID").unwrap_or_else(|_| {
+        let host =
+            std::env::var("HOSTNAME").unwrap_or_else(|_| format!("pid{}", std::process::id()));
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        format!("qf-{host}-{}", &nonce[..8])
+    });
+    tracing::info!(instance_id = %instance_id, "Replica instance ID");
 
+    // Distributed mode detection and validation. Resolved before AppState is
+    // built so the flag actually gates coordination: with `distributed: false`
+    // no capacity leases are taken, no queue claims are made, and the
+    // heartbeat/expiry/reconcile tasks (all keyed on `capacity_store`) stay off.
+    let distributed = config
+        .queryflux
+        .resolve_distributed(
+            distributed_backend
+                .as_ref()
+                .is_some_and(|b| b.supports_distributed_coordination()),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    if distributed {
+        tracing::warn!(
+            "Distributed coordination is enabled. \
+             This requires HA Postgres — during a Postgres outage the fleet reverts to \
+             per-replica capacity limits (group_limit × replicas worst case). \
+             Alert on queryflux_coordination_failures_total > 0."
+        );
+    }
+
+    let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> = distributed
+        .then(|| {
+            distributed_backend
+                .clone()
+                .map(|b| b as Arc<dyn queryflux_persistence::CapacityStore>)
+        })
+        .flatten();
+    let queue_coordinator: Option<Arc<dyn queryflux_persistence::QueueCoordinator>> = distributed
+        .then(|| {
+            distributed_backend
+                .clone()
+                .map(|b| b as Arc<dyn queryflux_persistence::QueueCoordinator>)
+        })
+        .flatten();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let app_state = Arc::new(AppState {
         external_address: external_address.clone(),
         live: live.clone(),
         persistence,
         translation,
         metrics,
-        auth_provider,
-        authorization,
         identity_resolver,
-        snowflake_sessions: SnowflakeSessionStore::new(snowflake_session_policy),
+        capacity_store,
+        queue_coordinator,
+        instance_id,
+        http_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("build shared http client"),
     });
 
     // --- Start admin server (Prometheus /metrics + future /admin/* endpoints) ---
     let admin_port = config.queryflux.admin_api.port;
-    let admin_store: Option<Arc<dyn AdminStore>> = pg_store
+    let admin_store: Option<Arc<dyn AdminStore>> = backend
         .clone()
-        .map(|pg| pg as Arc<dyn AdminStore>)
+        .map(|b| b as Arc<dyn AdminStore>)
         .or_else(|| mem_store.map(|m| m as Arc<dyn AdminStore>));
     let security_config = Arc::new(AdminSecurityConfigDto::from_config(
         &config.auth,
@@ -829,9 +880,9 @@ async fn main() -> Result<()> {
         std::env::var("QUERYFLUX_ADMIN_USER").unwrap_or_else(|_| config.admin_api.username.clone());
     let admin_password = std::env::var("QUERYFLUX_ADMIN_PASSWORD")
         .unwrap_or_else(|_| config.admin_api.password.clone());
-    let settings_store = pg_store
+    let settings_store = backend
         .clone()
-        .map(|pg| pg as Arc<dyn queryflux_persistence::ProxySettingsStore>);
+        .map(|b| b as Arc<dyn queryflux_persistence::ProxySettingsStore>);
     let admin_creds = Arc::new(queryflux_auth::AdminCredentialsManager::new(
         admin_username,
         admin_password,
@@ -852,8 +903,15 @@ async fn main() -> Result<()> {
     });
 
     let admin_store_for_reload = admin_store.clone();
+    let cors_origins = config.queryflux.admin_api.cors_allowed_origins.clone();
+    if cors_origins.is_empty() {
+        tracing::warn!(
+            "Admin API CORS allows any origin (corsAllowedOrigins is empty). \
+             Set queryflux.adminApi.corsAllowedOrigins to restrict cross-origin access in production."
+        );
+    }
     let admin = AdminFrontend::new(
-        prometheus,
+        prometheus.clone(),
         live.clone(),
         admin_store,
         admin_port,
@@ -864,17 +922,41 @@ async fn main() -> Result<()> {
         frontends_status,
         admin_creds,
         test_cluster_fn,
+        cors_origins,
     );
 
     // --- Start Trino HTTP frontend ---
     let trino_port = config.queryflux.frontends.trino_http.port;
-    let frontend = TrinoHttpFrontend::new(app_state.clone(), trino_port);
+    let frontend = TrinoHttpFrontend::new(
+        app_state.clone(),
+        trino_port,
+        config.queryflux.frontends.trino_http.max_connections,
+    );
 
     info!(
         "QueryFlux ready — Trino HTTP on :{trino_port}, admin/metrics on :{admin_port}, external address: {external_address}"
     );
 
-    if pg_store.is_some() {
+    if distributed {
+        if config
+            .queryflux
+            .periodic_config_reload_interval_secs()
+            .is_none()
+        {
+            tracing::warn!(
+                "Distributed mode with configReloadIntervalSecs: 0 — periodic config polling \
+                 is disabled. Config propagation relies solely on LISTEN/NOTIFY; if the \
+                 notification channel drops, replicas may become stale."
+            );
+        }
+        tracing::info!(
+            instance_id = %app_state.instance_id,
+            "Distributed mode enabled — global capacity, config revision, and queue \
+             coordination are active via the persistence backend"
+        );
+    }
+
+    if backend.is_some() {
         match config.queryflux.periodic_config_reload_interval_secs() {
             None => tracing::info!(
                 "Postgres persistence: routing rules and cluster/group config are cached in memory; periodic DB refresh is disabled (configReloadIntervalSecs: 0). Reloads still run after Studio/admin API writes."
@@ -886,48 +968,148 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Background task: push cluster utilization snapshots to Prometheus every 5s.
+    // Background task: push cluster utilization snapshots every 5s.
+    // In distributed mode, also queries CapacityStore for global running counts.
+    //
+    // Every replica refreshes its *local* Prometheus gauges (each replica's
+    // /metrics is scraped independently), but only the replica holding the
+    // sweep lock persists history rows to the backend — otherwise R replicas
+    // write R duplicate rows per cluster per tick and Studio's history tables
+    // grow R times faster.
     tokio::spawn({
         let state = app_state.clone();
+        let prometheus = prometheus.clone();
+        let backend = backend.clone();
+        let distributed_backend = distributed_backend.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
                 let cluster_manager = state.live.read().await.cluster_manager.clone();
-                if let Ok(snapshots) = cluster_manager.all_cluster_states().await {
-                    for snap in snapshots {
-                        let record = queryflux_metrics::ClusterSnapshot {
-                            cluster_name: snap.cluster_name,
-                            group_name: snap.group_name,
-                            engine_type: snap.engine_type,
-                            running_queries: snap.running_queries,
-                            queued_queries: snap.queued_queries,
-                            max_running_queries: snap.max_running_queries,
-                            recorded_at: chrono::Utc::now(),
-                        };
-                        let _ = state.metrics.record_cluster_snapshot(record).await;
+                let Ok(snapshots) = cluster_manager.all_cluster_states().await else {
+                    continue;
+                };
+                let mut records = Vec::with_capacity(snapshots.len());
+                for snap in snapshots {
+                    // In distributed mode, overlay global running count from CapacityStore
+                    // so metrics reflect the true cluster-wide utilization.
+                    let global_running = if let Some(cap) = &state.capacity_store {
+                        cap.active_count(&snap.cluster_name.0)
+                            .await
+                            .unwrap_or(snap.running_queries)
+                    } else {
+                        snap.running_queries
+                    };
+                    records.push(queryflux_metrics::ClusterSnapshot {
+                        cluster_name: snap.cluster_name,
+                        group_name: snap.group_name,
+                        engine_type: snap.engine_type,
+                        running_queries: global_running,
+                        queued_queries: snap.queued_queries,
+                        max_running_queries: snap.max_running_queries,
+                        recorded_at: chrono::Utc::now(),
+                    });
+                }
+                for record in &records {
+                    let _ = prometheus.record_cluster_snapshot(record.clone()).await;
+                }
+                // History rows go to the durable backend. When the backend can
+                // coordinate, only the sweep-lock owner persists this cycle; a
+                // coordination failure fails open (duplicate rows beat no rows).
+                // A non-coordinating backend persists unconditionally — it
+                // cannot dedup across replicas anyway.
+                let lock = match &distributed_backend {
+                    Some(db) => match db.try_sweep_lock("cluster-snapshots").await {
+                        Ok(Some(lock)) => Some(Some(lock)),
+                        Ok(None) => None, // another replica persists this cycle
+                        Err(e) => {
+                            tracing::debug!("Snapshot sweep lock failed: {e}");
+                            Some(None)
+                        }
+                    },
+                    None => Some(None),
+                };
+                if let Some(lock) = lock {
+                    if let Some(backend) = &backend {
+                        for record in records {
+                            let _ = backend.record_cluster_snapshot(record).await;
+                        }
+                    }
+                    if let Some(lock) = lock {
+                        lock.release().await;
                     }
                 }
             }
         }
     });
 
+    // Background task: renew capacity lease heartbeats for this replica every 60s so that
+    // long-running queries on a live instance are never reclaimed by `expire_stale` (cutoff
+    // is 300s — five missed beats). Leases of crashed replicas stop heartbeating and expire.
+    if let Some(cap) = app_state.capacity_store.clone() {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Err(e) = cap.heartbeat(&state.instance_id).await {
+                    state.metrics.on_coordination_failure("capacity_heartbeat");
+                    tracing::warn!("Capacity lease heartbeat failed: {e}");
+                }
+            }
+        });
+    }
+
     // Background task: release capacity for zombie executing queries (client disconnected
     // before polling to completion). Runs every 120s; evicts entries not polled for > 5 min.
     //
     // Uses `last_accessed` from persistence — updated by any proxy instance that handles
     // a poll, throttled to at most one write per 120s. Safe across multiple instances.
+    // Also expires stale capacity leases from crashed replicas.
     tokio::spawn({
         let state = app_state.clone();
+        let distributed_backend = distributed_backend.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300; // matches Trino's query.client.timeout default
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
             loop {
                 interval.tick().await;
+
+                // Single-owner sweep: the eviction and lease expiry below are global
+                // (idempotent, but redundant on every replica), so only the replica
+                // holding the advisory lock runs them this cycle. A crashed owner's
+                // lock is released with its connection, so another replica takes
+                // over on its next tick. On lock errors, fail open and sweep anyway.
+                let sweep_lock = match &distributed_backend {
+                    Some(backend) => match backend.try_sweep_lock("zombie-eviction").await {
+                        Ok(Some(lock)) => Some(lock),
+                        Ok(None) => continue, // another replica owns this cycle
+                        Err(e) => {
+                            state.metrics.on_coordination_failure("sweep_lock");
+                            tracing::warn!("Sweep lock failed, sweeping anyway: {e}");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+
+                let cutoff = chrono::Utc::now() - chrono::Duration::seconds(CLIENT_TIMEOUT_SECS);
+
+                // Expire stale capacity leases (crashed replicas).
+                if let Some(cap) = &state.capacity_store {
+                    match cap.expire_stale(cutoff).await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!("Expired {n} stale capacity leases"),
+                        Err(e) => {
+                            state.metrics.on_coordination_failure("capacity_expire");
+                            tracing::warn!("Capacity lease expiry failed: {e}");
+                        }
+                    }
+                }
+
                 let Ok(all) = state.persistence.list_all().await else {
                     continue;
                 };
-                let cutoff = chrono::Utc::now() - chrono::Duration::seconds(CLIENT_TIMEOUT_SECS);
                 for q in all {
                     if q.last_accessed < cutoff {
                         tracing::warn!(
@@ -937,6 +1119,22 @@ async fn main() -> Result<()> {
                             last_accessed = %q.last_accessed,
                             "Evicting zombie executing query — not polled for >5 min"
                         );
+
+                        // Best-effort cancel on the backend engine so the query
+                        // doesn't keep consuming cluster resources.
+                        if let Some(base_url) = &q.poll_base_url {
+                            let cancel_url =
+                                format!("{base_url}/v1/statement/executing/{}", q.backend_query_id);
+                            let client = state.http_client.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = client.delete(&cancel_url).send().await {
+                                    tracing::debug!(
+                                        "Zombie cancel request failed (best-effort): {e}"
+                                    );
+                                }
+                            });
+                        }
+
                         state
                             .metrics
                             .on_query_finished(&q.cluster_group.0, &q.cluster_name.0);
@@ -944,8 +1142,21 @@ async fn main() -> Result<()> {
                         let _ = cluster_manager
                             .release_cluster(&q.cluster_group, &q.cluster_name)
                             .await;
+                        if let Some(cap) = &state.capacity_store {
+                            if let Err(e) = cap.release(&q.cluster_name.0, &q.id.0).await {
+                                state.metrics.on_coordination_failure("capacity_release");
+                                tracing::warn!(
+                                    "CapacityStore release failed for zombie query {}: {e}",
+                                    q.id
+                                );
+                            }
+                        }
                         let _ = state.persistence.delete(&q.backend_query_id).await;
                     }
+                }
+
+                if let Some(lock) = sweep_lock {
+                    lock.release().await;
                 }
             }
         }
@@ -978,8 +1189,8 @@ async fn main() -> Result<()> {
     // Background task: enforce query_history_retention_days — runs hourly and deletes
     // query_records rows older than the configured retention window.
     // Only active when Postgres is configured and retention_days is set.
-    if let (Some(pg), Some(retention_days)) = (
-        pg_store.clone(),
+    if let (Some(backend), Some(retention_days)) = (
+        backend.clone(),
         config.queryflux.query_history_retention_days,
     ) {
         tokio::spawn(async move {
@@ -988,7 +1199,7 @@ async fn main() -> Result<()> {
             loop {
                 interval.tick().await;
                 let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
-                match pg.purge_old_query_records(cutoff).await {
+                match backend.purge_old_query_records(cutoff).await {
                     Ok(0) => {}
                     Ok(n) => {
                         tracing::info!("Purged {n} query records older than {retention_days} days")
@@ -999,28 +1210,60 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Background task: hot-reload routing rules + cluster configs from the DB on a timer **or**
-    // immediately when the admin API notifies (PUT/DELETE cluster, group, or routing config).
-    // Only active when Postgres persistence is configured.
-    // `configReloadIntervalSecs: 0` disables the timer; reloads happen only on admin notify.
+    // Background task: hot-reload routing rules + cluster configs from the DB when:
+    //   1. Another replica bumps the config revision (distributed LISTEN/NOTIFY via ConfigRevisionStore)
+    //   2. This replica's admin API writes config (local tokio::sync::Notify fast-path)
+    //   3. A periodic timer fires (safety-net polling, configurable via configReloadIntervalSecs)
+    //
+    // When no durable backend is configured, only local Notify triggers guard-chain reloads.
     tokio::spawn({
         let live = live.clone();
-        let pg = pg_store.clone();
+        let backend = backend.clone();
         let cache = adapter_reload_cache.clone();
         let notify = config_reload_notify.clone();
         let admin_for_reload = admin_store_for_reload;
         let periodic_secs = config.queryflux.periodic_config_reload_interval_secs();
+
+        // Subscribe to distributed config revision changes (push where the
+        // backend supports it, e.g. Postgres LISTEN/NOTIFY).
+        let revision_rx = if let Some(backend) = &backend {
+            match backend.subscribe_revisions().await {
+                Ok(Some(rx)) => {
+                    tracing::info!("Subscribed to backend config revision notifications");
+                    Some(rx)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("Failed to subscribe to config revision notifications: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         async move {
             async fn do_reload(
-                pg: &Arc<PostgresStore>,
+                backend: &Arc<dyn BackendStore>,
                 cache: &tokio::sync::Mutex<AdapterReloadCache>,
                 live: &Arc<tokio::sync::RwLock<LiveConfig>>,
             ) {
                 let mut cache_guard = cache.lock().await;
-                match reload_live_config(pg, &mut cache_guard).await {
+                // Snapshot the pieces a reload must never silently weaken; the
+                // read guard is dropped before the write below.
+                let prev = {
+                    let l = live.read().await;
+                    PreservedLive {
+                        auth_provider: l.auth_provider.clone(),
+                        authorization: l.authorization.clone(),
+                        guard_chain: l.guard_chain.clone(),
+                        group_guard_chains: l.group_guard_chains.clone(),
+                    }
+                };
+                match reload_live_config(backend, &mut cache_guard, &prev).await {
                     Ok(new_live) => {
                         *live.write().await = new_live;
-                        tracing::info!("Live config reloaded from Postgres");
+                        tracing::info!("Live config reloaded from backend");
                     }
                     Err(e) => tracing::warn!("Config reload failed: {e}"),
                 }
@@ -1051,15 +1294,72 @@ async fn main() -> Result<()> {
                 }
             }
 
+            async fn do_reload_or_guard(
+                backend: &Option<Arc<dyn BackendStore>>,
+                cache: &tokio::sync::Mutex<AdapterReloadCache>,
+                live: &Arc<tokio::sync::RwLock<LiveConfig>>,
+                admin: &Option<Arc<dyn AdminStore>>,
+            ) {
+                if let Some(backend) = backend {
+                    do_reload(backend, cache, live).await;
+                } else {
+                    // YAML-mode reload contract: without a Postgres backend, routing rules,
+                    // cluster configs, and adapters are fixed at startup from the YAML file
+                    // and cannot change at runtime. Only guard chains (stored in the admin
+                    // store) can be hot-reloaded via the admin API. Routing or cluster
+                    // changes in YAML require a process restart.
+                    reload_guard_chain_from_admin(admin, live).await;
+                }
+            }
+
+            // Wrap the optional receiver so we can always select on it.
+            let mut revision_rx = revision_rx;
+
+            // Coalesce notification bursts: a bulk admin save bumps the revision
+            // once per write, and each bump is one channel message — without
+            // draining, N rapid writes would trigger N full reloads (adapter
+            // rebuilds included) on every replica. A short settle window lets
+            // writes a few hundred ms apart collapse into one reload too.
+            async fn coalesce_revisions(rx: &mut Option<tokio::sync::mpsc::Receiver<u64>>) {
+                if let Some(rx) = rx.as_mut() {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    while rx.try_recv().is_ok() {}
+                }
+            }
+
+            // A future that resolves when the revision receiver gets a message,
+            // or pends forever if there is no receiver. A closed channel (the
+            // LISTEN/NOTIFY task died) drops the receiver so we don't spin on
+            // an immediately-ready `recv()`; periodic polling remains the
+            // safety net for config propagation.
+            async fn recv_revision(rx: &mut Option<tokio::sync::mpsc::Receiver<u64>>) -> u64 {
+                match rx {
+                    Some(r) => match r.recv().await {
+                        Some(rev) => rev,
+                        None => {
+                            tracing::warn!(
+                                "Config revision channel closed — falling back to periodic polling"
+                            );
+                            *rx = None;
+                            std::future::pending().await
+                        }
+                    },
+                    None => std::future::pending().await,
+                }
+            }
+
             match periodic_secs {
                 None => loop {
-                    notify.notified().await;
-                    tracing::debug!("Config reload requested via admin API");
-                    if let Some(pg) = &pg {
-                        do_reload(pg, &cache, &live).await;
-                    } else {
-                        reload_guard_chain_from_admin(&admin_for_reload, &live).await;
+                    tokio::select! {
+                        _ = notify.notified() => {
+                            tracing::debug!("Config reload triggered by local admin write");
+                        }
+                        rev = recv_revision(&mut revision_rx) => {
+                            tracing::debug!(revision = rev, "Config reload triggered by distributed revision change");
+                        }
                     }
+                    coalesce_revisions(&mut revision_rx).await;
+                    do_reload_or_guard(&backend, &cache, &live, &admin_for_reload).await;
                 },
                 Some(interval_secs) => {
                     let mut interval =
@@ -1069,14 +1369,14 @@ async fn main() -> Result<()> {
                         tokio::select! {
                             _ = interval.tick() => {}
                             _ = notify.notified() => {
-                                tracing::debug!("Config reload requested via admin API");
+                                tracing::debug!("Config reload triggered by local admin write");
+                            }
+                            rev = recv_revision(&mut revision_rx) => {
+                                tracing::debug!(revision = rev, "Config reload triggered by distributed revision change");
                             }
                         }
-                        if let Some(pg) = &pg {
-                            do_reload(pg, &cache, &live).await;
-                        } else {
-                            reload_guard_chain_from_admin(&admin_for_reload, &live).await;
-                        }
+                        coalesce_revisions(&mut revision_rx).await;
+                        do_reload_or_guard(&backend, &cache, &live, &admin_for_reload).await;
                     }
                 }
             }
@@ -1118,6 +1418,7 @@ async fn main() -> Result<()> {
     // Background task: reconcile in-memory running_queries counters with ground truth
     // from each engine (engines that implement fetch_running_query_count). Runs every 30s.
     // Corrects drift caused by proxy crashes, client disconnects, or any other leak.
+    // In distributed mode, local counters are a cache; CapacityStore is authoritative.
     tokio::spawn({
         let state = app_state.clone();
         async move {
@@ -1129,9 +1430,16 @@ async fn main() -> Result<()> {
                     live.health_check_targets.clone()
                 };
                 for (adapter, cstate) in &targets {
+                    // In distributed mode, sync local counter from CapacityStore (global truth).
+                    if let Some(cap) = &state.capacity_store {
+                        if let Ok(global) = cap.active_count(&cstate.cluster_name.0).await {
+                            cstate.set_running_queries(global);
+                            continue;
+                        }
+                    }
+
                     let tracked = cstate.running_queries();
                     let max = cstate.max_running_queries();
-                    // `decrement_running` used to wrap on underflow; or reload can desync counters.
                     if tracked > max {
                         let fix = adapter.fetch_running_query_count().await.unwrap_or(0);
                         tracing::warn!(
@@ -1162,60 +1470,188 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Run all enabled frontends concurrently; any one exiting stops the process.
-    let mysql_future = async {
-        match &config.queryflux.frontends.mysql_wire {
-            Some(cfg) if cfg.enabled => {
-                MysqlWireFrontend::new(app_state.clone(), cfg.port)
-                    .listen()
-                    .await
+    // Spawn all enabled frontends as tasks. Each frontend observes `shutdown_rx`
+    // internally: axum-based frontends use `with_graceful_shutdown` (stop accepting,
+    // finish in-flight requests), wire-based frontends break their accept loop, and
+    // tonic (Flight SQL) uses `serve_with_shutdown`.
+    let mut trino_handle = tokio::spawn({
+        let fe = frontend;
+        let rx = shutdown_rx.clone();
+        async move { fe.listen(rx).await }
+    });
+    let mut admin_handle = tokio::spawn({
+        let rx = shutdown_rx.clone();
+        async move { admin.listen(rx).await }
+    });
+    let mut mysql_handle = tokio::spawn({
+        let state = app_state.clone();
+        let rx = shutdown_rx.clone();
+        let cfg = config.queryflux.frontends.mysql_wire.clone();
+        async move {
+            match cfg {
+                Some(c) if c.enabled => {
+                    MysqlWireFrontend::new(state, c.port, c.max_connections)
+                        .listen(rx)
+                        .await
+                }
+                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
-            _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
         }
-    };
-
-    let postgres_future = async {
-        match &config.queryflux.frontends.postgres_wire {
-            Some(cfg) if cfg.enabled => {
-                PostgresWireFrontend::new(app_state.clone(), cfg.port)
-                    .listen()
-                    .await
+    });
+    let mut postgres_handle = tokio::spawn({
+        let state = app_state.clone();
+        let rx = shutdown_rx.clone();
+        let cfg = config.queryflux.frontends.postgres_wire.clone();
+        async move {
+            match cfg {
+                Some(c) if c.enabled => {
+                    PostgresWireFrontend::new(state, c.port, c.max_connections)
+                        .listen(rx)
+                        .await
+                }
+                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
-            _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
         }
-    };
-
-    let flight_sql_future = async {
-        match &config.queryflux.frontends.flight_sql {
-            Some(cfg) if cfg.enabled => {
-                FlightSqlFrontend::new(app_state.clone(), cfg.port)
-                    .listen()
-                    .await
+    });
+    let mut flight_sql_handle = tokio::spawn({
+        let state = app_state.clone();
+        let rx = shutdown_rx.clone();
+        let cfg = config.queryflux.frontends.flight_sql.clone();
+        async move {
+            match cfg {
+                Some(c) if c.enabled => {
+                    FlightSqlFrontend::new(state, c.port, c.max_connections)
+                        .listen(rx)
+                        .await
+                }
+                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
-            _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
         }
-    };
-
-    let snowflake_future = async {
-        match &config.queryflux.frontends.snowflake_http {
-            Some(cfg) if cfg.enabled => {
-                SnowflakeFrontend::new(app_state.clone(), cfg.port)
-                    .listen()
-                    .await
+    });
+    let mut snowflake_handle = tokio::spawn({
+        let state = app_state.clone();
+        let rx = shutdown_rx.clone();
+        let cfg = config.queryflux.frontends.snowflake_http.clone();
+        async move {
+            match cfg {
+                Some(c) if c.enabled => SnowflakeFrontend::new(state, c).listen(rx).await,
+                _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
             }
-            _ => std::future::pending::<queryflux_core::error::Result<()>>().await,
+        }
+    });
+
+    // Wait for either a shutdown signal or an unexpected frontend exit.
+    let shutdown_signal = async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("register SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => tracing::info!("Received SIGINT — initiating graceful shutdown"),
+                _ = sigterm.recv() => tracing::info!("Received SIGTERM — initiating graceful shutdown"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.ok();
+            tracing::info!("Received Ctrl-C — initiating graceful shutdown");
         }
     };
 
     tokio::select! {
-        r = frontend.listen()   => r.map_err(|e| anyhow::anyhow!("{e}"))?,
-        r = admin.listen()      => r.map_err(|e| anyhow::anyhow!("{e}"))?,
-        r = mysql_future        => r.map_err(|e| anyhow::anyhow!("{e}"))?,
-        r = postgres_future     => r.map_err(|e| anyhow::anyhow!("{e}"))?,
-        r = flight_sql_future   => r.map_err(|e| anyhow::anyhow!("{e}"))?,
-        r = snowflake_future    => r.map_err(|e| anyhow::anyhow!("{e}"))?,
+        _ = shutdown_signal => {},
+        r = &mut trino_handle   => { if let Ok(Err(e)) = r { tracing::error!("Trino HTTP exited unexpectedly: {e}"); } },
+        r = &mut admin_handle   => { if let Ok(Err(e)) = r { tracing::error!("Admin exited unexpectedly: {e}"); } },
+        r = &mut mysql_handle   => { if let Ok(Err(e)) = r { tracing::error!("MySQL wire exited unexpectedly: {e}"); } },
+        r = &mut postgres_handle => { if let Ok(Err(e)) = r { tracing::error!("Postgres wire exited unexpectedly: {e}"); } },
+        r = &mut flight_sql_handle => { if let Ok(Err(e)) = r { tracing::error!("Flight SQL exited unexpectedly: {e}"); } },
+        r = &mut snowflake_handle => { if let Ok(Err(e)) = r { tracing::error!("Snowflake exited unexpectedly: {e}"); } },
     }
 
+    // --- Phase 1: signal all frontends to stop accepting new connections ---
+    let _ = shutdown_tx.send(true);
+
+    // --- Phase 2: drain in-flight requests ---
+    let drain_timeout_secs = config.queryflux.shutdown_drain_timeout_secs();
+    let drain_timeout = std::time::Duration::from_secs(drain_timeout_secs);
+    tracing::info!("Draining in-flight requests (timeout: {drain_timeout_secs}s)...");
+
+    let drain_future = async {
+        // Wait for all frontends to finish processing in-flight requests.
+        // Axum frontends complete when all connections are done; wire frontends
+        // return immediately from their accept loop but spawned connection tasks
+        // continue running.
+        let _ = tokio::join!(
+            trino_handle,
+            admin_handle,
+            mysql_handle,
+            postgres_handle,
+            flight_sql_handle,
+            snowflake_handle,
+        );
+
+        // Poll persistence until no executing or queued queries remain (or until
+        // the outer timeout fires). This covers spawned wire-protocol connection
+        // handlers that are still mid-query after the accept loop exited.
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            interval.tick().await;
+            let executing = app_state
+                .persistence
+                .list_all()
+                .await
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let queued = app_state
+                .persistence
+                .list_queued()
+                .await
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if executing == 0 && queued == 0 {
+                tracing::info!("All in-flight queries drained");
+                break;
+            }
+            tracing::info!(executing, queued, "Waiting for queries to drain...");
+        }
+    };
+
+    if tokio::time::timeout(drain_timeout, drain_future)
+        .await
+        .is_err()
+    {
+        let executing = app_state
+            .persistence
+            .list_all()
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let queued = app_state
+            .persistence
+            .list_queued()
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0);
+        tracing::warn!(
+            executing,
+            queued,
+            "Drain timeout reached after {drain_timeout_secs}s — forcing shutdown"
+        );
+    }
+
+    // --- Phase 3: release capacity leases owned by this replica ---
+    tracing::info!("Releasing capacity leases for this replica...");
+    if let Some(cap) = &app_state.capacity_store {
+        if let Err(e) = cap.release_all_for_instance(&app_state.instance_id).await {
+            tracing::warn!("Failed to release capacity leases on shutdown: {e}");
+        } else {
+            tracing::info!("Capacity leases released");
+        }
+    }
+
+    tracing::info!("QueryFlux shutdown complete");
     Ok(())
 }
 
@@ -1277,6 +1713,95 @@ fn health_targets_from_groups(
         }
     }
     out
+}
+
+/// Validate referential integrity of a config that is about to go live.
+///
+/// Returns a list of human-readable issue strings (empty = valid). Callers should
+/// treat any non-empty return as a fatal config error and keep the previous LiveConfig.
+///
+/// Checks:
+///  - `routing_fallback` names a group that exists in `group_members`.
+///  - Every static `target_group` reference in `routers_cfg` names a group in `group_members`.
+///    (PythonScript routers are skipped — their target group is computed at runtime.)
+///  - Every cluster name listed in `group_members` has a built adapter in `adapters`.
+fn validate_live_config_refs(
+    routers_cfg: &[queryflux_core::config::RouterConfig],
+    routing_fallback: &str,
+    group_members: &HashMap<String, Vec<String>>,
+    adapters: &HashMap<String, queryflux_engine_adapters::AdapterKind>,
+) -> Vec<String> {
+    use queryflux_core::config::RouterConfig;
+
+    let mut issues: Vec<String> = Vec::new();
+
+    if !group_members.contains_key(routing_fallback) {
+        issues.push(format!(
+            "routing_fallback references unknown group '{routing_fallback}'"
+        ));
+    }
+
+    for router in routers_cfg {
+        let mut refs: Vec<&str> = Vec::new();
+        match router {
+            RouterConfig::ProtocolBased {
+                trino_http,
+                postgres_wire,
+                mysql_wire,
+                clickhouse_http,
+                flight_sql,
+                snowflake_http,
+                snowflake_sql_api,
+            } => {
+                let opts: [Option<&str>; 7] = [
+                    trino_http.as_deref(),
+                    postgres_wire.as_deref(),
+                    mysql_wire.as_deref(),
+                    clickhouse_http.as_deref(),
+                    flight_sql.as_deref(),
+                    snowflake_http.as_deref(),
+                    snowflake_sql_api.as_deref(),
+                ];
+                refs.extend(opts.into_iter().flatten());
+            }
+            RouterConfig::Header {
+                header_value_to_group,
+                ..
+            } => {
+                refs.extend(header_value_to_group.values().map(String::as_str));
+            }
+            RouterConfig::UserGroup { user_to_group } => {
+                refs.extend(user_to_group.values().map(String::as_str));
+            }
+            RouterConfig::QueryRegex { rules } => {
+                refs.extend(rules.iter().map(|r| r.target_group.as_str()));
+            }
+            RouterConfig::Tags { rules } => {
+                refs.extend(rules.iter().map(|r| r.target_group.as_str()));
+            }
+            RouterConfig::Compound { target_group, .. } => {
+                refs.push(target_group.as_str());
+            }
+            RouterConfig::PythonScript { .. } => {}
+        }
+        for group in refs {
+            if !group_members.contains_key(group) {
+                issues.push(format!("router references unknown group '{group}'"));
+            }
+        }
+    }
+
+    for (group, members) in group_members {
+        for member in members {
+            if !adapters.contains_key(member.as_str()) {
+                issues.push(format!(
+                    "group '{group}' member '{member}' has no built adapter"
+                ));
+            }
+        }
+    }
+
+    issues
 }
 
 /// Build a `LiveConfig` from DB cluster records, group maps, and router chain components.
@@ -1450,6 +1975,7 @@ async fn build_live_config(
         group_order.push(group_name.clone());
         group_states.insert(group_key, (states, strategy));
     }
+    group_order.sort();
 
     let health_check_targets = health_targets_from_groups(&group_states, &cache.adapters);
     cache.cluster_states = health_check_targets
@@ -1603,6 +2129,27 @@ async fn build_live_config(
         .map(|(name, g)| (name.clone(), g.default_tags.clone()))
         .collect();
 
+    // Referential integrity: routers must target groups that exist in this reload cycle,
+    // and every declared group member must have a built adapter. A stale read (e.g. a
+    // group deleted between the cluster read and the group read) would produce a live
+    // config where dispatch returns NoClusterGroupAvailable with no explanation.
+    // On any inconsistency, bail out so the caller keeps the previous LiveConfig.
+    let issues = validate_live_config_refs(
+        routers_cfg,
+        routing_fallback,
+        &group_members,
+        &cache.adapters,
+    );
+    if !issues.is_empty() {
+        for issue in &issues {
+            tracing::warn!("Live config validation: {issue}");
+        }
+        return Err(anyhow::anyhow!(
+            "Live config is internally inconsistent ({} issue(s)); keeping previous config",
+            issues.len()
+        ));
+    }
+
     Ok(LiveConfig {
         router_chain,
         guard_chain: None,
@@ -1615,6 +2162,8 @@ async fn build_live_config(
         group_order,
         group_translation_scripts,
         group_default_tags,
+        auth_provider: Arc::new(NoneAuthProvider::new(false)),
+        authorization: Arc::new(AllowAllAuthorization),
     })
 }
 
@@ -1622,12 +2171,22 @@ async fn build_live_config(
 /// Existing adapter instances are reused for clusters that haven't changed.
 ///
 /// Cluster records are passed directly to `build_live_config` — no `to_core()` conversion.
-async fn reload_live_config(
-    pg: &Arc<queryflux_persistence::postgres::PostgresStore>,
-    cache: &mut AdapterReloadCache,
-) -> Result<LiveConfig> {
-    use queryflux_persistence::{ClusterConfigStore, RoutingConfigStore};
+/// Hot pieces carried over from the previous `LiveConfig` when their backing
+/// rows are absent from the backend (never configured via admin) or fail to
+/// parse. A reload must never revert auth to permissive defaults or drop
+/// YAML-configured guard chains just because no row was ever written.
+struct PreservedLive {
+    auth_provider: Arc<dyn queryflux_auth::AuthProvider>,
+    authorization: Arc<dyn queryflux_auth::AuthorizationChecker>,
+    guard_chain: Option<Arc<GuardChain>>,
+    group_guard_chains: HashMap<String, Arc<GuardChain>>,
+}
 
+async fn reload_live_config(
+    pg: &Arc<dyn BackendStore>,
+    cache: &mut AdapterReloadCache,
+    prev: &PreservedLive,
+) -> Result<LiveConfig> {
     let cluster_records = pg
         .list_cluster_configs()
         .await
@@ -1682,7 +2241,7 @@ async fn reload_live_config(
             tracing::warn!(error = %e, "reload: load_group_translation_bodies failed");
             HashMap::new()
         });
-    let guard_script_bodies = load_guard_script_bodies(Some(pg)).await;
+    let guard_script_bodies = load_guard_script_bodies(Some(pg.as_ref() as &dyn AdminStore)).await;
 
     let mut live = build_live_config(
         &cluster_records,
@@ -1696,21 +2255,185 @@ async fn reload_live_config(
     )
     .await?;
 
-    // Load guardrails from DB (UI-managed). Overrides any YAML-configured guard chains.
-    if let Ok(Some(v)) = pg.get_proxy_setting("guardrails_config").await {
-        let (global, groups) = build_guard_chains_from_db_value(&v, &guard_script_bodies);
-        live.guard_chain = global;
-        live.group_guard_chains = groups;
+    // Carry forward the pieces build_live_config seeds with placeholders. The
+    // DB reads below only *override* these on success — a missing row or a
+    // parse failure keeps the previous (startup-YAML or last-good) values.
+    live.auth_provider = prev.auth_provider.clone();
+    live.authorization = prev.authorization.clone();
+    live.guard_chain = prev.guard_chain.clone();
+    live.group_guard_chains = prev.group_guard_chains.clone();
+
+    // Guardrails from DB (UI-managed) override carried-over chains. An admin
+    // "clear" still writes an empty `global` row, so Ok(None) can only mean
+    // "never configured via admin" — keep the previous (e.g. YAML) chains.
+    match pg.get_proxy_setting("guardrails_config").await {
+        Ok(Some(v)) => {
+            let (global, groups) = build_guard_chains_from_db_value(&v, &guard_script_bodies);
+            live.guard_chain = global;
+            live.group_guard_chains = groups;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("Reload: guardrails_config read failed; keeping previous chains: {e}")
+        }
+    }
+
+    // Rebuild auth/authz from persisted security config. On a missing row or
+    // any parse/build failure keep the carried-over providers — a reload must
+    // never fall back to permissive defaults.
+    match pg.get_proxy_setting("security_config").await {
+        Ok(Some(v)) => {
+            let (auth_cfg, authz_cfg) = parse_security_setting(&v);
+            match auth_cfg.map(|cfg| build_auth_provider(&cfg)) {
+                Some(Ok(provider)) => live.auth_provider = provider,
+                Some(Err(e)) => {
+                    tracing::warn!("Reload: failed to rebuild auth provider; keeping previous: {e}")
+                }
+                None => tracing::warn!(
+                    "Reload: security_config has no recognizable auth section; keeping previous"
+                ),
+            }
+            match authz_cfg.map(|cfg| build_authorization(&cfg, &cluster_groups)) {
+                Some(Ok(checker)) => live.authorization = checker,
+                Some(Err(e)) => {
+                    tracing::warn!("Reload: failed to rebuild authorization; keeping previous: {e}")
+                }
+                None => tracing::warn!(
+                    "Reload: security_config has no recognizable authorization section; keeping previous"
+                ),
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("Reload: security_config read failed; keeping previous auth: {e}")
+        }
     }
 
     Ok(live)
 }
 
-async fn load_guard_script_bodies(pg: Option<&PostgresStore>) -> HashMap<i64, String> {
-    let Some(pg) = pg else {
+/// Parse the persisted `security_config` proxy setting into typed configs.
+///
+/// `PUT /admin/config/security` stores the flat `UpsertSecurityConfig` shape
+/// (`auth_provider`, `auth_required`, `authorization_provider`, ...); earlier
+/// builds wrapped typed configs under `authConfig` / `authorizationConfig`.
+/// Accept both so existing rows keep working. Returns `None` for a section
+/// that is absent or fails to parse.
+fn parse_security_setting(
+    v: &serde_json::Value,
+) -> (
+    Option<queryflux_core::config::AuthConfig>,
+    Option<queryflux_core::config::AuthorizationConfig>,
+) {
+    use serde_json::{json, Value};
+
+    let auth = if let Some(wrapped) = v.get("authConfig") {
+        serde_json::from_value(wrapped.clone()).ok()
+    } else if v.get("auth_provider").is_some() {
+        serde_json::from_value(json!({
+            "provider": v.get("auth_provider").cloned().unwrap_or(Value::Null),
+            "required": v.get("auth_required").cloned().unwrap_or(Value::Bool(false)),
+            "oidc": v.get("oidc").cloned().unwrap_or(Value::Null),
+            "ldap": v.get("ldap").cloned().unwrap_or(Value::Null),
+            "staticUsers": v.get("static_users").cloned().unwrap_or(Value::Null),
+        }))
+        .ok()
+    } else {
+        None
+    };
+
+    let authz = if let Some(wrapped) = v.get("authorizationConfig") {
+        serde_json::from_value(wrapped.clone()).ok()
+    } else if v.get("authorization_provider").is_some() {
+        serde_json::from_value(json!({
+            "provider": v.get("authorization_provider").cloned().unwrap_or(Value::Null),
+            "openfga": v.get("openfga").cloned().unwrap_or(Value::Null),
+        }))
+        .ok()
+    } else {
+        None
+    };
+
+    (auth, authz)
+}
+
+fn build_auth_provider(
+    auth: &queryflux_core::config::AuthConfig,
+) -> Result<Arc<dyn queryflux_auth::AuthProvider>> {
+    use queryflux_core::config::AuthProviderConfig;
+    let auth_required = auth.required;
+    Ok(match &auth.provider {
+        AuthProviderConfig::None => {
+            info!("Auth provider: none (network-trust only)");
+            Arc::new(NoneAuthProvider::new(auth_required))
+        }
+        AuthProviderConfig::Static => {
+            let users = auth
+                .static_users
+                .as_ref()
+                .context("auth.provider = static requires auth.staticUsers to be configured")?
+                .users
+                .clone();
+            info!(user_count = users.len(), "Auth provider: static");
+            Arc::new(StaticAuthProvider::new(users, auth_required))
+        }
+        AuthProviderConfig::Oidc => {
+            let oidc_cfg = auth
+                .oidc
+                .clone()
+                .context("auth.provider = oidc requires auth.oidc to be configured")?;
+            info!(issuer = %oidc_cfg.issuer, "Auth provider: OIDC");
+            Arc::new(OidcAuthProvider::new(oidc_cfg, auth_required))
+        }
+        AuthProviderConfig::Ldap => {
+            let ldap_cfg = auth
+                .ldap
+                .clone()
+                .context("auth.provider = ldap requires auth.ldap to be configured")?;
+            info!(url = %ldap_cfg.url, "Auth provider: LDAP");
+            Arc::new(LdapAuthProvider::new(ldap_cfg, auth_required))
+        }
+    })
+}
+
+fn build_authorization(
+    authz: &queryflux_core::config::AuthorizationConfig,
+    cluster_groups: &HashMap<String, queryflux_core::config::ClusterGroupConfig>,
+) -> Result<Arc<dyn queryflux_auth::AuthorizationChecker>> {
+    use queryflux_core::config::AuthorizationProviderConfig;
+    Ok(match &authz.provider {
+        AuthorizationProviderConfig::None => {
+            let policies = cluster_groups
+                .iter()
+                .map(|(name, cfg)| (name.clone(), cfg.authorization.clone()))
+                .collect();
+            let has_any_policy = cluster_groups.values().any(|cfg| {
+                !cfg.authorization.allow_groups.is_empty()
+                    || !cfg.authorization.allow_users.is_empty()
+            });
+            if has_any_policy {
+                info!("Authorization: simple allow-list policy");
+                Arc::new(SimpleAuthorizationPolicy::new(policies))
+            } else {
+                info!("Authorization: allow-all (no allow-lists configured)");
+                Arc::new(AllowAllAuthorization)
+            }
+        }
+        AuthorizationProviderConfig::OpenFga => {
+            let openfga_cfg = authz.openfga.clone().context(
+                "authorization.provider = openfga requires authorization.openfga to be configured",
+            )?;
+            info!(url = %openfga_cfg.url, store_id = %openfga_cfg.store_id, "Authorization: OpenFGA");
+            Arc::new(OpenFgaAuthorizationClient::new(openfga_cfg))
+        }
+    })
+}
+
+async fn load_guard_script_bodies(store: Option<&dyn AdminStore>) -> HashMap<i64, String> {
+    let Some(store) = store else {
         return HashMap::new();
     };
-    load_guard_script_bodies_from_admin(pg).await
+    load_guard_script_bodies_from_admin(store).await
 }
 
 async fn load_guard_script_bodies_from_admin(admin: &dyn AdminStore) -> HashMap<i64, String> {
@@ -1986,4 +2709,62 @@ fn build_guard_chains_from_db_value(
         .unwrap_or_default();
 
     (global, groups)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_security_setting;
+    use queryflux_core::config::{AuthProviderConfig, AuthorizationProviderConfig};
+    use serde_json::json;
+
+    /// The shape `PUT /admin/config/security` actually persists
+    /// (flat `UpsertSecurityConfig` fields).
+    #[test]
+    fn parse_security_setting_flat_admin_shape() {
+        let v = json!({
+            "auth_provider": "static",
+            "auth_required": true,
+            "oidc": null,
+            "ldap": null,
+            "static_users": { "users": { "alice": { "password": "pw" } } },
+            "authorization_provider": "none",
+            "openfga": null,
+        });
+        let (auth, authz) = parse_security_setting(&v);
+        let auth = auth.expect("auth section should parse");
+        assert!(matches!(auth.provider, AuthProviderConfig::Static));
+        assert!(auth.required);
+        assert!(auth.static_users.is_some());
+        let authz = authz.expect("authz section should parse");
+        assert!(matches!(authz.provider, AuthorizationProviderConfig::None));
+    }
+
+    /// Legacy wrapped shape from earlier builds.
+    #[test]
+    fn parse_security_setting_wrapped_legacy_shape() {
+        let v = json!({
+            "authConfig": { "provider": "none", "required": true },
+            "authorizationConfig": { "provider": "openfga", "openfga": {
+                "url": "http://fga:8080", "storeId": "s1", "model": null
+            }},
+        });
+        let (auth, authz) = parse_security_setting(&v);
+        let auth = auth.expect("wrapped auth should parse");
+        assert!(matches!(auth.provider, AuthProviderConfig::None));
+        assert!(auth.required);
+        let authz = authz.expect("wrapped authz should parse");
+        assert!(matches!(
+            authz.provider,
+            AuthorizationProviderConfig::OpenFga
+        ));
+    }
+
+    /// Unrecognizable value: both sections None so the caller preserves
+    /// the previous providers instead of weakening to permissive defaults.
+    #[test]
+    fn parse_security_setting_unrecognized_yields_none() {
+        let (auth, authz) = parse_security_setting(&json!({ "something": "else" }));
+        assert!(auth.is_none());
+        assert!(authz.is_none());
+    }
 }

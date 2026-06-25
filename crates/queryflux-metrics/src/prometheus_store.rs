@@ -25,6 +25,25 @@ pub struct PrometheusMetrics {
     /// Incremented once per tag per completed query. Allows tag-based aggregation
     /// and filtering in Prometheus/Grafana. Tags in `tags_deny_list` are not emitted.
     query_tags_total: CounterVec,
+    /// queryflux_coordination_failures_total{operation}
+    ///
+    /// Failures of distributed-coordination operations (capacity leases, queue
+    /// claims) against the persistence backend. Each failure means the replica
+    /// fell back to local-only behavior, so global limits were not enforced for
+    /// that operation — alert on a sustained rate.
+    coordination_failures_total: CounterVec,
+    /// queryflux_capacity_degraded_total{cluster_group, cluster_name}
+    ///
+    /// Queries admitted in degraded mode — global capacity lease unavailable,
+    /// replica fell back to local limits. Non-zero means global max_running_queries
+    /// was not enforced for those admits. Pair with coordination_failures_total.
+    capacity_degraded_total: CounterVec,
+    /// queryflux_auth_failures_total{protocol}
+    auth_failures_total: CounterVec,
+    /// queryflux_queue_rejections_total{cluster_group}
+    queue_rejections_total: CounterVec,
+    /// queryflux_queue_duration_seconds{cluster_group}
+    queue_duration_seconds: HistogramVec,
     /// Tag keys that are excluded from `query_tags_total` to control cardinality.
     tags_deny_list: Vec<String>,
 }
@@ -87,12 +106,58 @@ impl PrometheusMetrics {
             &["tag_key", "tag_value", "cluster_group"],
         )?;
 
+        let coordination_failures_total = CounterVec::new(
+            Opts::new(
+                "queryflux_coordination_failures_total",
+                "Distributed-coordination operations that failed and fell back to local-only behavior",
+            ),
+            &["operation"],
+        )?;
+
+        let capacity_degraded_total = CounterVec::new(
+            Opts::new(
+                "queryflux_capacity_degraded_total",
+                "Queries admitted in degraded mode (global capacity lease unavailable, local limits used)",
+            ),
+            &["cluster_group", "cluster_name"],
+        )?;
+
+        let auth_failures_total = CounterVec::new(
+            Opts::new(
+                "queryflux_auth_failures_total",
+                "Authentication failures (wrong password, expired token, etc.)",
+            ),
+            &["protocol"],
+        )?;
+
+        let queue_rejections_total = CounterVec::new(
+            Opts::new(
+                "queryflux_queue_rejections_total",
+                "Queries rejected because maxQueuedQueries limit was reached",
+            ),
+            &["cluster_group"],
+        )?;
+
+        let queue_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "queryflux_queue_duration_seconds",
+                "Time queries spent waiting in the proxy queue before dispatch",
+            )
+            .buckets(vec![0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0]),
+            &["cluster_group"],
+        )?;
+
         registry.register(Box::new(queries_total.clone()))?;
         registry.register(Box::new(query_duration_seconds.clone()))?;
         registry.register(Box::new(translated_total.clone()))?;
         registry.register(Box::new(running_queries.clone()))?;
         registry.register(Box::new(queued_queries.clone()))?;
         registry.register(Box::new(query_tags_total.clone()))?;
+        registry.register(Box::new(coordination_failures_total.clone()))?;
+        registry.register(Box::new(capacity_degraded_total.clone()))?;
+        registry.register(Box::new(auth_failures_total.clone()))?;
+        registry.register(Box::new(queue_rejections_total.clone()))?;
+        registry.register(Box::new(queue_duration_seconds.clone()))?;
 
         Ok(Self {
             registry,
@@ -102,6 +167,11 @@ impl PrometheusMetrics {
             running_queries,
             queued_queries,
             query_tags_total,
+            coordination_failures_total,
+            capacity_degraded_total,
+            auth_failures_total,
+            queue_rejections_total,
+            queue_duration_seconds,
             tags_deny_list,
         })
     }
@@ -141,6 +211,30 @@ impl MetricsStore for PrometheusMetrics {
         }
     }
 
+    fn on_coordination_failure(&self, operation: &str) {
+        self.coordination_failures_total
+            .with_label_values(&[operation])
+            .inc();
+    }
+
+    fn on_capacity_degraded(&self, cluster_group: &str, cluster_name: &str) {
+        self.capacity_degraded_total
+            .with_label_values(&[cluster_group, cluster_name])
+            .inc();
+    }
+
+    fn on_auth_failure(&self, protocol: &str) {
+        self.auth_failures_total
+            .with_label_values(&[protocol])
+            .inc();
+    }
+
+    fn on_queue_full(&self, cluster_group: &str) {
+        self.queue_rejections_total
+            .with_label_values(&[cluster_group])
+            .inc();
+    }
+
     async fn record_query(&self, record: QueryRecord) -> Result<()> {
         let engine = format!("{:?}", record.engine_type);
         let group = record.cluster_group.0.as_str().to_string();
@@ -154,6 +248,12 @@ impl MetricsStore for PrometheusMetrics {
         self.query_duration_seconds
             .with_label_values(&[&engine, &group])
             .observe(record.execution_duration_ms as f64 / 1000.0);
+
+        if record.queue_duration_ms > 0 {
+            self.queue_duration_seconds
+                .with_label_values(&[&group])
+                .observe(record.queue_duration_ms as f64 / 1000.0);
+        }
 
         if record.was_translated {
             let src = format!("{:?}", record.source_dialect);

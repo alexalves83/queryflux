@@ -50,6 +50,12 @@ anyhow = "1.0.102"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
+# OpenTelemetry (optional distributed tracing)
+opentelemetry = "0.30"
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.31"
+
 # Async trait support
 async-trait = "0.1.89"
 

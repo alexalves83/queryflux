@@ -24,3 +24,16 @@ WARNING: persistence.type is "inMemory" but you are running more than one replic
 diverge across replicas. Configure Postgres persistence under
 config.data.queryflux.persistence for multi-replica deployments.
 {{- end }}
+{{- $snowflakeCfg := dig "data" "queryflux" "frontends" "snowflakeHttp" (dict) .Values.config }}
+{{- if and $snowflakeCfg (dig "enabled" true $snowflakeCfg) (or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1)) }}
+
+WARNING: the Snowflake HTTP frontend is enabled with more than one replica
+(replicaCount > 1 or autoscaling enabled). Snowflake sessions are held in
+pod-local memory, so every request of a session must reach the same pod.
+Configure sticky sessions (session affinity) on the load balancer or ingress
+in front of the Snowflake port. The other frontends (Trino HTTP, MySQL/
+PostgreSQL wire, Flight SQL) do not need affinity. You can set
+config.data.queryflux.enforceSnowflakeHttpSessionAffinity: true to make
+QueryFlux refuse to start until the affinity requirement is acknowledged in
+config.
+{{- end }}

@@ -1,33 +1,74 @@
-//! Snowflake Wire Protocol frontend (Form 1) — Design B: protocol bridge.
+//! Snowflake HTTP wire v1 protocol support — session-based `/session/v1/*` and
+//! `/queries/v1/*` endpoints.
 //!
-//! Exposes `routes()` — a stateless `Router<Arc<AppState>>` that can be merged with
-//! other route sets and have state injected at the top level.
+//! `SnowflakeWireState` bundles the shared `AppState` with the per-frontend
+//! `SnowflakeSessionStore`. Axum's `FromRef` lets SQL API v2 handlers (which only
+//! need `Arc<AppState>`) continue to work transparently when the combined state is used.
 
 use std::sync::Arc;
 
-use axum::{
-    routing::{delete, get, post},
-    Router,
-};
+use axum::extract::FromRef;
+use axum::routing::{delete, get, post};
+use axum::Router;
 
+use crate::snowflake::http::session_store::SnowflakeSessionStore;
 use crate::state::AppState;
-
-use handlers::{query, session, token};
 
 pub mod format;
 pub mod handlers;
 pub mod session_store;
 
-pub fn routes() -> Router<Arc<AppState>> {
+// ---------------------------------------------------------------------------
+// Combined frontend state
+// ---------------------------------------------------------------------------
+
+/// State type used by the Snowflake HTTP wire v1 routes.
+///
+/// Bundles the shared `AppState` (used by routing, dispatch, auth) with the
+/// process-local session store (owned exclusively by this frontend). Nothing
+/// outside the `snowflake` module ever references `SnowflakeSessionStore`.
+#[derive(Clone)]
+pub struct SnowflakeWireState {
+    pub app: Arc<AppState>,
+    pub sessions: Arc<SnowflakeSessionStore>,
+}
+
+/// Allow Axum handlers that only need `Arc<AppState>` to extract it from
+/// `SnowflakeWireState` via `State<Arc<AppState>>`. Used by the SQL API v2
+/// handlers which are merged onto the same port.
+impl FromRef<SnowflakeWireState> for Arc<AppState> {
+    fn from_ref(s: &SnowflakeWireState) -> Self {
+        s.app.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+/// HTTP wire v1 route table. All handlers extract `State<SnowflakeWireState>`.
+pub fn routes() -> Router<SnowflakeWireState> {
     Router::new()
-        .route("/session/v1/login-request", post(session::login_request))
-        .route("/session", delete(session::logout))
-        .route("/session/heartbeat", get(session::heartbeat))
-        .route("/session/token-request", post(token::token_request))
-        .route("/queries/v1/query-request", post(query::query_request))
+        .route(
+            "/session/v1/login-request",
+            post(handlers::session::login_request),
+        )
+        .route("/session", delete(handlers::session::logout))
+        .route("/session/heartbeat", get(handlers::session::heartbeat))
+        .route(
+            "/session/token-request",
+            post(handlers::token::token_request),
+        )
+        .route(
+            "/queries/v1/query-request",
+            post(handlers::query::query_request),
+        )
         .route(
             "/queries/v1/query-monitoring-request",
-            get(query::query_monitoring_request),
+            get(handlers::query::query_monitoring_request),
         )
-        .route("/queries/v1/{query_id}", delete(query::cancel_query))
+        .route(
+            "/queries/v1/{query_id}",
+            delete(handlers::query::cancel_query),
+        )
 }

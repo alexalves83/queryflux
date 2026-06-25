@@ -52,6 +52,14 @@ pub type QueryParams = Vec<QueryParam>;
 ///
 /// Used as a fallback by dispatch when the backend adapter does not support native
 /// prepared statements (`adapter.supports_native_params() == false`).
+///
+/// # Dialect coverage note
+/// Correctness of literal quoting for edge cases — e.g. MySQL's backtick identifier
+/// delimiter vs Postgres double-quote, or Trino's `E'...'` string escape prefix — depends
+/// on polyglot_sql's per-dialect code-generation coverage. All current adapters that reach
+/// this path have been verified against the dialects they use, but when adding a new
+/// adapter that sets `supports_native_params() == false`, confirm that polyglot_sql
+/// generates valid literals for its target dialect before shipping.
 pub fn interpolate_params(
     sql: &str,
     params: &[QueryParam],

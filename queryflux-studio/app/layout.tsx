@@ -3,7 +3,6 @@ import { Geist, Geist_Mono } from "next/font/google";
 import type { Metadata } from "next";
 import { ClientShell } from "./client-shell";
 import "./globals.css";
-import "swagger-ui-react/swagger-ui.css";
 
 export const metadata: Metadata = {
   title: "QueryFlux Studio",

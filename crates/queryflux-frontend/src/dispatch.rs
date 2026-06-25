@@ -15,12 +15,11 @@ use queryflux_core::tags::{merge_tags, QueryTags};
 use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{
-        ClusterGroupName, ClusterName, EngineType, ExecutingQuery, FrontendProtocol, ProxyQueryId,
+        ClusterGroupName, ClusterName, ExecutingQuery, FrontendProtocol, ProxyQueryId,
         QueryEngineStats, QueryExecution, QueryStats, QueryStatus, QueuedQuery,
     },
     session::SessionContext,
 };
-use queryflux_engine_adapters::trino::api::TrinoResponse;
 use queryflux_engine_adapters::{AdapterKind, AsyncAdapter, ConnectionFormat, SyncAdapter};
 use queryflux_guardrails::{GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
@@ -79,7 +78,7 @@ pub enum DispatchOutcome {
 /// `http://queryflux:9000/v1/statement/executing/{id}/{token}`
 ///
 /// Any instance can then reconstruct the Trino URL by looking up the stored
-/// `trino_endpoint` and re-joining it with the path.
+/// `poll_base_url` and re-joining it with the path extracted from the client request.
 async fn cluster_db_ids(
     mgr: &std::sync::Arc<dyn ClusterGroupManager>,
     group: &ClusterGroupName,
@@ -115,22 +114,30 @@ pub async fn dispatch_query(
     protocol: FrontendProtocol,
     group: ClusterGroupName,
     already_queued: bool,
+    // When this query was first enqueued (`None` for a query that has never
+    // been queued). Drives the admission fairness gate: older waiters win.
+    queued_since: Option<chrono::DateTime<Utc>>,
     sequence: u64,
     auth_ctx: &AuthContext,
 ) -> Result<DispatchOutcome> {
-    // Authorization check — first gate before any resource acquisition.
-    // Phase 1: AllowAllAuthorization always returns true (no behavior change).
-    if !state.authorization.check(auth_ctx, &group.0).await {
-        return Err(QueryFluxError::Unauthorized(format!(
-            "user '{}' is not authorized to run queries on cluster group '{}'",
-            auth_ctx.user, group.0
-        )));
-    }
-
-    // Clone the manager, group translation fixups, default tags, and guard chains in one snapshot.
-    let (cluster_manager, group_fixups, group_default_tags, guard_chain, group_guard_chain) = {
+    // Snapshot all live config fields in one lock acquisition. The guard is
+    // dropped before any await point so no lock is held during I/O.
+    let (
+        authorization,
+        cluster_manager,
+        group_fixups,
+        group_default_tags,
+        guard_chain,
+        group_guard_chain,
+        cluster_cfg,
+        // TODO: plumb max_queued_queries through LiveConfig. Add a field like
+        // `group_max_queued_queries: HashMap<String, Option<u64>>` to LiveConfig,
+        // populated from ClusterGroupConfig.max_queued_queries during reload.
+        max_queued_queries,
+    ) = {
         let live = state.live.read().await;
         (
+            live.authorization.clone(),
             live.cluster_manager.clone(),
             live.group_translation_scripts
                 .get(&group.0)
@@ -142,12 +149,68 @@ pub async fn dispatch_query(
                 .unwrap_or_default(),
             live.guard_chain.clone(),
             live.group_guard_chains.get(&group.0).cloned(),
+            // cluster_cfg resolved after cluster selection below; captured here
+            // so credential resolution uses the same config generation.
+            live.cluster_configs.clone(),
+            None::<u64>,
         )
     };
+
+    if !authorization.check(auth_ctx, &group.0).await {
+        return Err(QueryFluxError::Unauthorized(format!(
+            "user '{}' is not authorized to run queries on cluster group '{}'",
+            auth_ctx.user, group.0
+        )));
+    }
+
     let effective_tags = merge_tags(&group_default_tags, &session.tags().clone());
 
+    // Admission fairness: don't take a slot that an older, actively-polling
+    // queued query is waiting for. Only binds when capacity is scarce — with
+    // free slots to spare the gate is a cheap local check and admits.
+    if should_yield_to_older_queued(state, &cluster_manager, &group, queued_since).await {
+        let uri = persist_queued_query(
+            state,
+            query_id,
+            sql,
+            session,
+            protocol,
+            group,
+            already_queued,
+            sequence,
+            max_queued_queries,
+        )
+        .await?;
+        return Ok(DispatchOutcome::Queued {
+            queued_next_uri: uri,
+        });
+    }
+
     let cluster_name = match cluster_manager.acquire_cluster(&group).await? {
-        Some(c) => c,
+        Some(c) => {
+            match acquire_global_capacity(state, &cluster_manager, &group, &c, &query_id.0).await {
+                CapacityGrant::Denied => {
+                    // Global capacity full — release local slot and queue.
+                    let _ = cluster_manager.release_cluster(&group, &c).await;
+                    let uri = persist_queued_query(
+                        state,
+                        query_id,
+                        sql,
+                        session,
+                        protocol,
+                        group,
+                        already_queued,
+                        sequence,
+                        max_queued_queries,
+                    )
+                    .await?;
+                    return Ok(DispatchOutcome::Queued {
+                        queued_next_uri: uri,
+                    });
+                }
+                CapacityGrant::Granted => c,
+            }
+        }
         None => {
             let uri = persist_queued_query(
                 state,
@@ -158,6 +221,7 @@ pub async fn dispatch_query(
                 group,
                 already_queued,
                 sequence,
+                max_queued_queries,
             )
             .await?;
             return Ok(DispatchOutcome::Queued {
@@ -166,22 +230,41 @@ pub async fn dispatch_query(
         }
     };
 
+    // RAII guard: from here on the local slot and global lease are released on
+    // every exit — including the future being dropped when the client
+    // disconnects mid-dispatch, which previously leaked the lease permanently
+    // (the owning replica keeps heartbeating, so expiry never reclaims it).
+    let mut slot = ClusterSlotGuard::new(
+        cluster_manager.clone(),
+        group.clone(),
+        cluster_name.clone(),
+        state.metrics.clone(),
+        state.capacity_store.clone(),
+        query_id.0.clone(),
+    );
+
     let (cluster_group_config_id, cluster_config_id) =
         cluster_db_ids(&cluster_manager, &group, &cluster_name).await;
 
     state.metrics.on_query_started(&group.0, &cluster_name.0);
 
-    let cluster_cfg = state.cluster_config_cloned(&cluster_name.0).await;
-    let credentials = state
+    let this_cluster_cfg = cluster_cfg.get(&cluster_name.0).cloned();
+    let credentials = match state
         .identity_resolver
-        .resolve(auth_ctx, cluster_cfg.as_ref())
-        .await;
+        .resolve(auth_ctx, this_cluster_cfg.as_ref())
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            slot.release().await;
+            return Err(e);
+        }
+    };
 
     let adapter_kind = match state.adapter(&cluster_name.0).await {
         Some(a) => a,
         None => {
-            state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
+            slot.release().await;
             return Err(QueryFluxError::Engine(format!(
                 "No adapter for {group}/{cluster_name}"
             )));
@@ -206,8 +289,7 @@ pub async fn dispatch_query(
         Ok(t) => t,
         Err(e) => {
             warn!(id = %query_id, "Translation error: {e}");
-            state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
+            slot.release().await;
             return Err(e);
         }
     };
@@ -279,10 +361,10 @@ pub async fn dispatch_query(
                     engine_stats: None,
                     guard_actions: $actions,
                     was_guard_blocked: true,
+                    queue_duration_ms: 0,
                 },
             );
-            state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
+            slot.release().await;
             return Err(QueryFluxError::Engine(deny_reason));
         }};
     }
@@ -304,10 +386,19 @@ pub async fn dispatch_query(
     }
 
     // Serialize guard actions for storage in ExecutingQuery (retrieved at poll time).
+    // Treat serialization failure as fatal — silently omitting guard actions from the
+    // audit record would produce incomplete compliance logs.
     let submitted_guard_actions: Vec<serde_json::Value> = all_guard_actions
         .iter()
-        .filter_map(|a| serde_json::to_value(a).ok())
-        .collect();
+        .map(|a| {
+            serde_json::to_value(a).map_err(|e| {
+                QueryFluxError::Engine(format!(
+                    "Failed to serialize guard action '{}': {e}",
+                    a.guard
+                ))
+            })
+        })
+        .collect::<queryflux_core::error::Result<Vec<_>>>()?;
 
     match adapter_kind {
         AdapterKind::Async(adapter) => {
@@ -323,8 +414,7 @@ pub async fn dispatch_query(
             {
                 Ok(e) => e,
                 Err(e) => {
-                    state.metrics.on_query_finished(&group.0, &cluster_name.0);
-                    let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
+                    slot.release().await;
                     warn!(id = %query_id, "Submit error: {e}");
                     return Err(e);
                 }
@@ -333,12 +423,22 @@ pub async fn dispatch_query(
             if already_queued {
                 let _ = state.persistence.delete_queued(&query_id).await;
             }
+            let queue_duration_ms = queued_since
+                .map(|t| (Utc::now() - t).num_milliseconds().max(0) as u64)
+                .unwrap_or(0);
+            if queue_duration_ms > 0 {
+                debug!(id = %query_id, queue_ms = queue_duration_ms, "Queued query dispatched");
+            }
 
-            let QueryExecution::Async {
-                backend_query_id,
-                next_uri,
-                initial_body,
-            } = execution;
+            // Extract backend_query_id first so we can build ExecutingQuery before branching.
+            let backend_query_id = match &execution {
+                QueryExecution::Running {
+                    backend_query_id, ..
+                } => backend_query_id.clone(),
+                QueryExecution::Completed {
+                    backend_query_id, ..
+                } => backend_query_id.clone(),
+            };
             let now = Utc::now();
             let executing = ExecutingQuery {
                 id: query_id.clone(),
@@ -353,7 +453,7 @@ pub async fn dispatch_query(
                 cluster_group_config_id,
                 cluster_config_id,
                 backend_query_id: backend_query_id.clone(),
-                trino_endpoint: adapter.base_url().to_string(),
+                poll_base_url: Some(adapter.base_url().to_string()),
                 creation_time: now,
                 last_accessed: now,
                 query_tags: effective_tags,
@@ -361,325 +461,284 @@ pub async fn dispatch_query(
                 submitted_guard_actions,
                 was_guard_blocked: false,
             };
-            let _ = state.persistence.upsert(executing.clone()).await;
-            info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query submitted (async)");
 
-            if next_uri.is_none() {
-                if let Some(ref ib) = initial_body {
-                    if engine_type == EngineType::Trino {
-                        finalize_trino_async_terminal_on_submit(
-                            state,
-                            &cluster_manager,
-                            &executing,
-                            &adapter,
-                            &session,
-                            protocol,
-                            ib,
-                        )
-                        .await;
-                    }
-                }
-            }
-
-            let proxy_next_uri = next_uri
-                .as_deref()
-                .map(|uri| rewrite_trino_uri(uri, &state.external_address));
-            Ok(DispatchOutcome::Async {
-                initial_body,
-                proxy_next_uri,
-            })
-        }
-        AdapterKind::Sync(sync_adapter) => {
-            if already_queued {
-                let _ = state.persistence.delete_queued(&query_id).await;
-            }
-
-            info!(id = %query_id, cluster = %cluster_name, "Query executing (sync via dispatch)");
-            let start = Instant::now();
-
-            let mut sink = crate::trino_http::result_sink::TrinoHttpResultSink::new(&query_id.0);
-
-            debug!(id = %query_id, "sync dispatch: calling execute_as_arrow");
-            let (status, rows, error) = match sync_adapter
-                .execute_as_arrow(
-                    &sql,
-                    &session,
-                    &credentials,
-                    &effective_tags,
-                    &effective_params,
-                )
-                .await
-            {
-                Ok(execution) => {
-                    debug!(id = %query_id, "sync dispatch: execute_as_arrow returned stream");
-                    let mut stream = execution.stream;
-                    let mut schema_sent = false;
-                    let mut total_rows: u64 = 0;
-                    let mut stream_err: Option<String> = None;
-                    let mut batch_count: u64 = 0;
-
-                    while let Some(result) = stream.next().await {
-                        match result {
-                            Ok(batch) => {
-                                if !schema_sent {
-                                    debug!(id = %query_id, cols = batch.num_columns(), "sync dispatch: on_schema");
-                                    let _ = sink.on_schema(batch.schema_ref()).await;
-                                    schema_sent = true;
-                                }
-                                total_rows += batch.num_rows() as u64;
-                                batch_count += 1;
-                                debug!(id = %query_id, batch = batch_count, rows = batch.num_rows(), "sync dispatch: on_batch");
-                                let _ = sink.on_batch(&batch).await;
-                                debug!(id = %query_id, batch = batch_count, "sync dispatch: on_batch done");
+            match execution {
+                QueryExecution::Running {
+                    poll_token,
+                    initial_response,
+                    ..
+                } => {
+                    // Slot ownership transfers to the executing record: poll, cancel,
+                    // and zombie-eviction paths release it from here on. If the record
+                    // can't be persisted, cancel the engine-side query best-effort so
+                    // it doesn't burn cluster resources invisibly, then release the slot.
+                    if let Err(e) = state.persistence.upsert(executing.clone()).await {
+                        warn!(id = %query_id, "Failed to persist executing query: {e}");
+                        let cancel_adapter = adapter.clone();
+                        let cancel_id = backend_query_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(ce) = cancel_adapter.cancel_query(&cancel_id).await {
+                                warn!(backend = %cancel_id, "Best-effort cancel after persistence failure: {ce}");
                             }
-                            Err(e) => {
-                                stream_err = Some(e.to_string());
-                                let _ = sink.on_error(stream_err.as_ref().unwrap()).await;
-                                break;
-                            }
-                        }
+                        });
+                        slot.release().await;
+                        return Err(QueryFluxError::Persistence(format!(
+                            "persist executing query: {e}"
+                        )));
                     }
+                    slot.disarm();
+                    // TODO: persist queue_duration_ms so the poll handler can include it
+                    // in the final QueryOutcome. Either add a field to ExecutingQuery or
+                    // store it in a side-channel (e.g. a metadata column).
+                    info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, queue_ms = queue_duration_ms, "Query submitted (async)");
 
-                    if !schema_sent {
-                        debug!(id = %query_id, "sync dispatch: empty schema");
-                        let _ = sink.on_schema(&Schema::empty()).await;
-                    }
-
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
-                    let stats = QueryStats {
-                        execution_duration_ms: elapsed_ms,
-                        rows_returned: total_rows,
-                        ..Default::default()
-                    };
-                    debug!(id = %query_id, total_rows, "sync dispatch: on_complete");
-                    let _ = sink.on_complete(&stats).await;
-
-                    if let Some(err_msg) = stream_err {
-                        (QueryStatus::Failed, None, Some(err_msg))
-                    } else {
-                        (QueryStatus::Success, Some(total_rows), None)
-                    }
+                    let proxy_next_uri = poll_token
+                        .as_deref()
+                        .map(|uri| rewrite_trino_uri(uri, &state.external_address));
+                    Ok(DispatchOutcome::Async {
+                        initial_body: initial_response,
+                        proxy_next_uri,
+                    })
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    warn!(id = %query_id, cluster = %cluster_name, "Sync execute_as_arrow failed: {msg}");
-                    let _ = sink.on_error(&msg).await;
-                    (QueryStatus::Failed, None, Some(msg))
-                }
-            };
-
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-
-            let ctx = QueryContext {
-                query_id,
-                sql: original_sql,
-                session,
-                protocol,
-                group: group.clone(),
-                cluster: cluster_name.clone(),
-                cluster_group_config_id,
-                cluster_config_id,
-                engine_type,
-                src_dialect,
-                tgt_dialect,
-                was_translated,
-                translated_sql: if was_translated { Some(sql) } else { None },
-                query_tags: effective_tags,
-                query_params: effective_params,
-                agent_context: resolved_agent_ctx,
-            };
-            state.record_query(
-                &ctx,
-                QueryOutcome {
-                    backend_query_id: None,
+                QueryExecution::Completed {
                     status,
-                    execution_ms: elapsed_ms,
-                    rows,
                     error,
-                    routing_trace: None,
-                    engine_stats: None,
-                    guard_actions: all_guard_actions,
-                    was_guard_blocked: false,
-                },
-            );
-
-            state.metrics.on_query_finished(&group.0, &cluster_name.0);
-            let _ = cluster_manager.release_cluster(&group, &cluster_name).await;
-
-            debug!(id = %ctx.query_id, "sync dispatch: calling into_bytes");
-            let body_bytes = sink.into_bytes();
-            debug!(id = %ctx.query_id, bytes = body_bytes.len(), "sync dispatch: into_bytes done");
-            Ok(DispatchOutcome::Async {
-                initial_body: Some(body_bytes),
-                proxy_next_uri: None,
-            })
-        }
-    }
-}
-
-/// Determine the terminal `QueryOutcome` from a Trino submit response body.
-///
-/// Parses the body to determine success vs failure. `engine_stats` is passed in
-/// from `adapter.terminal_stats_from_body()` — Trino-specific stats parsing lives
-/// in the adapter, not here.
-///
-/// Returns `(outcome, Option<warn_log_message>)`.
-fn trino_submit_terminal_outcome(
-    body: &Bytes,
-    elapsed_ms: u64,
-    backend_id: String,
-    engine_stats: Option<QueryEngineStats>,
-) -> (QueryOutcome, Option<String>) {
-    let trino_resp: TrinoResponse = match serde_json::from_slice(body.as_ref()) {
-        Ok(r) => r,
-        Err(e) => {
-            let warn_msg = format!(
-                "trino submit terminal body JSON parse failed: {e}; releasing cluster + clearing persistence"
-            );
-            return (
-                QueryOutcome {
-                    backend_query_id: Some(backend_id),
-                    status: QueryStatus::Failed,
-                    execution_ms: elapsed_ms,
-                    rows: None,
-                    error: Some(format!("failed to parse Trino response: {e}")),
-                    routing_trace: None,
                     engine_stats,
-                    guard_actions: vec![],
-                    was_guard_blocked: false,
-                },
-                Some(warn_msg),
-            );
+                    initial_response,
+                    ..
+                } => {
+                    // Query finished on the initial submit — no poll handler will be called.
+                    // Disarm the RAII guard; finalize will call release_query_slot explicitly.
+                    slot.disarm();
+                    info!(id = %query_id, backend = %backend_query_id, cluster = %cluster_name, "Query completed on submit");
+                    let was_translated = executing.translated_sql.is_some();
+                    let src_dialect = protocol.default_dialect();
+                    let ctx = QueryContext {
+                        query_id: executing.id.clone(),
+                        sql: executing
+                            .translated_sql
+                            .as_deref()
+                            .unwrap_or(&executing.sql)
+                            .to_string(),
+                        session: session.clone(),
+                        protocol,
+                        group: executing.cluster_group.clone(),
+                        cluster: executing.cluster_name.clone(),
+                        cluster_group_config_id: executing.cluster_group_config_id,
+                        cluster_config_id: executing.cluster_config_id,
+                        engine_type: adapter.engine_type(),
+                        src_dialect,
+                        tgt_dialect: adapter.translation_target_dialect(),
+                        was_translated,
+                        translated_sql: if was_translated {
+                            Some(executing.sql.clone())
+                        } else {
+                            None
+                        },
+                        query_tags: executing.query_tags.clone(),
+                        query_params: vec![],
+                        agent_context: executing.agent_context.clone(),
+                    };
+                    finalize_async_terminal_on_submit(
+                        state,
+                        &executing,
+                        ctx,
+                        status,
+                        error,
+                        engine_stats,
+                        queue_duration_ms,
+                    )
+                    .await;
+                    Ok(DispatchOutcome::Async {
+                        initial_body: initial_response,
+                        proxy_next_uri: None,
+                    })
+                }
+            }
         }
-    };
-
-    let backend_id = Some(backend_id);
-
-    if let Some(err) = &trino_resp.error {
-        (
-            QueryOutcome {
-                backend_query_id: backend_id,
-                status: QueryStatus::Failed,
-                execution_ms: elapsed_ms,
-                rows: None,
-                error: Some(err.message.clone()),
-                routing_trace: None,
-                engine_stats,
-                guard_actions: vec![],
-                was_guard_blocked: false,
-            },
-            None,
-        )
-    } else if trino_resp.stats.state == "FAILED" {
-        (
-            QueryOutcome {
-                backend_query_id: backend_id,
-                status: QueryStatus::Failed,
-                execution_ms: elapsed_ms,
-                rows: None,
-                error: Some("Trino query FAILED".to_string()),
-                routing_trace: None,
-                engine_stats,
-                guard_actions: vec![],
-                was_guard_blocked: false,
-            },
-            None,
-        )
-    } else {
-        (
-            QueryOutcome {
-                backend_query_id: backend_id,
-                status: QueryStatus::Success,
-                execution_ms: elapsed_ms,
-                rows: None,
-                error: None,
-                routing_trace: None,
-                engine_stats,
-                guard_actions: vec![],
-                was_guard_blocked: false,
-            },
-            None,
-        )
+        AdapterKind::Sync(_) => {
+            // dispatch_query is the async path only. A sync cluster selected by
+            // round-robin in a mixed group signals the caller to retry via
+            // execute_to_sink, which will drive its own slot acquisition loop.
+            slot.release().await;
+            Err(QueryFluxError::SyncEngineRequired(cluster_name.0.clone()))
+        }
     }
 }
 
-/// Trino may return `FINISHED` with no `nextUri` on the initial POST `/v1/statement` response.
-/// Clients then never call GET `/v1/statement/...`, so `get_executing_statement` never runs —
-/// mirror its metrics, `record_query`, and persistence cleanup here.
-///
-/// Collapsed from 4 branches (including JSON parse error) to a single `record_query` call.
-async fn finalize_trino_async_terminal_on_submit(
+/// Called when `submit_query` returns `QueryExecution::Completed` — the adapter
+/// signalled the query is done on the initial POST (fast queries, immediate errors).
+/// Handles the protocol-neutral record/release/cleanup that the poll handler would
+/// otherwise perform, since no poll request will ever arrive for this query.
+async fn finalize_async_terminal_on_submit(
     state: &Arc<AppState>,
-    cluster_manager: &Arc<dyn ClusterGroupManager>,
     executing: &ExecutingQuery,
-    adapter: &Arc<dyn AsyncAdapter>,
-    session: &SessionContext,
-    protocol: FrontendProtocol,
-    body: &Bytes,
+    ctx: QueryContext,
+    status: QueryStatus,
+    error: Option<String>,
+    engine_stats: Option<QueryEngineStats>,
+    queue_duration_ms: u64,
 ) {
     let elapsed_ms = (Utc::now() - executing.creation_time)
         .num_milliseconds()
         .max(0) as u64;
 
-    let was_translated = executing.translated_sql.is_some();
-    let src_dialect = protocol.default_dialect();
-    let ctx = QueryContext {
-        query_id: executing.id.clone(),
-        sql: executing
-            .translated_sql
-            .as_deref()
-            .unwrap_or(&executing.sql)
-            .to_string(),
-        session: session.clone(),
-        protocol,
-        group: executing.cluster_group.clone(),
-        cluster: executing.cluster_name.clone(),
-        cluster_group_config_id: executing.cluster_group_config_id,
-        cluster_config_id: executing.cluster_config_id,
-        engine_type: adapter.engine_type(),
-        src_dialect,
-        tgt_dialect: adapter.translation_target_dialect(),
-        was_translated,
-        translated_sql: if was_translated {
-            Some(executing.sql.clone())
-        } else {
-            None
-        },
-        query_tags: executing.query_tags.clone(),
-        query_params: vec![],
-        agent_context: executing.agent_context.clone(),
+    let stored_actions: Vec<queryflux_persistence::GuardAction> = match serde_json::from_value(
+        serde_json::Value::Array(executing.submitted_guard_actions.clone()),
+    ) {
+        Ok(actions) => actions,
+        Err(e) => {
+            warn!(id = %executing.id, "Failed to deserialize stored guard actions: {e}");
+            vec![]
+        }
     };
 
-    let engine_stats = adapter.terminal_stats_from_body(body);
-    let (mut outcome, warn_msg) = trino_submit_terminal_outcome(
-        body,
-        elapsed_ms,
-        executing.backend_query_id.0.clone(),
+    let mut outcome = QueryOutcome {
+        backend_query_id: Some(executing.backend_query_id.0.clone()),
+        status,
+        execution_ms: elapsed_ms,
+        rows: None,
+        error,
+        routing_trace: None,
         engine_stats,
-    );
-
-    // Inject guard actions captured at submit time into the final audit record.
-    let stored_actions: Vec<queryflux_persistence::GuardAction> = serde_json::from_value(
-        serde_json::Value::Array(executing.submitted_guard_actions.clone()),
-    )
-    .unwrap_or_default();
+        guard_actions: vec![],
+        was_guard_blocked: false,
+        queue_duration_ms,
+    };
     if !stored_actions.is_empty() {
         outcome.guard_actions = stored_actions;
         outcome.was_guard_blocked = executing.was_guard_blocked;
     }
 
-    if let Some(msg) = warn_msg {
-        warn!(proxy_id = %executing.id, "{msg}");
-    }
-
-    state
-        .metrics
-        .on_query_finished(&executing.cluster_group.0, &executing.cluster_name.0);
     state.record_query(&ctx, outcome);
-    let _ = cluster_manager
-        .release_cluster(&executing.cluster_group, &executing.cluster_name)
+    state
+        .release_query_slot(
+            &executing.cluster_group,
+            &executing.cluster_name,
+            &executing.id.0,
+        )
         .await;
-    let _ = state.persistence.delete(&executing.backend_query_id).await;
+    if let Err(e) = state.persistence.delete(&executing.backend_query_id).await {
+        warn!(id = %executing.id, "Failed to delete executing record on terminal submit: {e}");
+    }
+}
+
+/// Effective `max_running_queries` for a cluster, as resolved in the hot-reloaded
+/// local config (cluster override or inherited group limit) — this is what the
+/// global capacity check enforces. Falls back to unlimited if the snapshot is
+/// unavailable, consistent with the fail-open posture of distributed coordination.
+async fn effective_max_running(
+    cluster_manager: &Arc<dyn ClusterGroupManager>,
+    group: &ClusterGroupName,
+    cluster: &ClusterName,
+) -> u64 {
+    cluster_manager
+        .cluster_state(group, cluster)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.max_running_queries)
+        .unwrap_or(u64::MAX)
+}
+
+/// How recently a queued query must have been polled to count as an active
+/// waiter in the fairness gate. Trino clients poll about once a second, so a
+/// client gone for this long has almost certainly disconnected — excluding it
+/// keeps a dead client from blocking admission (head-of-line) until the
+/// stale-queue cleanup removes its row minutes later.
+const QUEUE_ACTIVE_WINDOW_SECS: i64 = 15;
+
+/// Admission fairness gate: should this query yield instead of taking a slot?
+///
+/// True only when both hold:
+/// 1. the group's free capacity (local snapshot) does not exceed the number of
+///    older, actively-polling queued queries — i.e. every remaining slot is
+///    spoken for by someone who was here first, and
+/// 2. such waiters exist at all.
+///
+/// `queued_since` is the caller's own enqueue time (`None` = never queued, so
+/// every active waiter outranks it). The free-slot check runs first and is
+/// in-memory, so under healthy load the gate never touches the backend.
+/// Backend errors fail open — fairness degrades to poll-order rather than
+/// blocking admission.
+///
+/// **Best-effort ordering**: there is an inherent race between this check and
+/// the actual slot acquisition that follows. Under distributed load an older
+/// waiter may be dispatched by a different replica in that window, making the
+/// yield decision stale. The gate provides FIFO *on average* — it is not a
+/// strict ordering guarantee.
+async fn should_yield_to_older_queued(
+    state: &Arc<AppState>,
+    cluster_manager: &Arc<dyn ClusterGroupManager>,
+    group: &ClusterGroupName,
+    queued_since: Option<chrono::DateTime<Utc>>,
+) -> bool {
+    let free = match cluster_manager.all_cluster_states().await {
+        Ok(snaps) => snaps
+            .iter()
+            .filter(|s| s.group_name.0 == group.0 && s.enabled && s.is_healthy)
+            .map(|s| s.max_running_queries.saturating_sub(s.running_queries))
+            .sum::<u64>(),
+        // Can't tell — don't block admission on a read failure.
+        Err(_) => return false,
+    };
+    if free == 0 {
+        // Nothing to take; acquire_cluster will queue this query anyway.
+        return false;
+    }
+    let active_after = Utc::now() - chrono::Duration::seconds(QUEUE_ACTIVE_WINDOW_SECS);
+    match state
+        .persistence
+        .count_active_queued_before(&group.0, queued_since, active_after)
+        .await
+    {
+        Ok(older_waiters) => older_waiters >= free,
+        Err(e) => {
+            warn!("Fairness gate query failed; admitting without ordering: {e}");
+            false
+        }
+    }
+}
+
+/// Result of a global capacity acquisition attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapacityGrant {
+    /// Capacity confirmed available by the coordination backend.
+    Granted,
+    /// Global capacity is full or coordination backend unreachable (fail-closed) —
+    /// caller must queue or back off.
+    Denied,
+}
+
+/// In distributed mode, take a global capacity lease for a cluster slot that
+/// was just acquired locally. Coordination failures fail closed (query is queued
+/// rather than admitted without global coordination) and are counted in
+/// `queryflux_coordination_failures_total`. Always `Granted` outside distributed mode.
+async fn acquire_global_capacity(
+    state: &Arc<AppState>,
+    cluster_manager: &Arc<dyn ClusterGroupManager>,
+    group: &ClusterGroupName,
+    cluster: &ClusterName,
+    query_id: &str,
+) -> CapacityGrant {
+    let Some(cap) = &state.capacity_store else {
+        return CapacityGrant::Granted;
+    };
+    let max_rq = effective_max_running(cluster_manager, group, cluster).await;
+    match cap
+        .try_acquire(&cluster.0, max_rq, &state.instance_id, query_id)
+        .await
+    {
+        Ok(true) => CapacityGrant::Granted,
+        Ok(false) => CapacityGrant::Denied,
+        Err(e) => {
+            state.metrics.on_coordination_failure("capacity_acquire");
+            tracing::warn!(
+                "CapacityStore try_acquire failed, rejecting to queue (fail-closed): {e}"
+            );
+            CapacityGrant::Denied
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -692,7 +751,28 @@ async fn persist_queued_query(
     group: ClusterGroupName,
     _already_stored: bool,
     sequence: u64,
+    max_queued_queries: Option<u64>,
 ) -> Result<String> {
+    // Enforce queue depth limit before admitting to the queue.
+    if let Some(limit) = max_queued_queries {
+        if limit > 0 {
+            let active_after = Utc::now() - chrono::Duration::seconds(QUEUE_ACTIVE_WINDOW_SECS);
+            let count = state
+                .persistence
+                .count_active_queued_before(&group.0, None, active_after)
+                .await
+                .unwrap_or(0);
+            if count >= limit {
+                return Err(QueryFluxError::Other(anyhow::anyhow!(
+                    "Queue full for group '{}': {}/{} queued queries",
+                    group.0,
+                    count,
+                    limit
+                )));
+            }
+        }
+    }
+
     let now = Utc::now();
     let queued = QueuedQuery {
         id: query_id.clone(),
@@ -704,7 +784,7 @@ async fn persist_queued_query(
         last_accessed: now,
         sequence,
     };
-    let _ = state.persistence.upsert_queued(queued).await;
+    state.persistence.upsert_queued(queued).await?;
     let next_seq = sequence + 1;
     Ok(format!(
         "{}/v1/statement/qf/queued/{}/{}",
@@ -736,6 +816,8 @@ struct ClusterSlotGuard {
     group: ClusterGroupName,
     cluster: ClusterName,
     metrics: Arc<dyn MetricsStore>,
+    capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>>,
+    query_id: String,
     released: bool,
 }
 
@@ -745,14 +827,25 @@ impl ClusterSlotGuard {
         group: ClusterGroupName,
         cluster: ClusterName,
         metrics: Arc<dyn MetricsStore>,
+        capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>>,
+        query_id: String,
     ) -> Self {
         Self {
             cluster_manager,
             group,
             cluster,
             metrics,
+            capacity_store,
+            query_id,
             released: false,
         }
+    }
+
+    /// Transfer slot ownership out of this guard without releasing — used when
+    /// an async query has been durably persisted as executing and the terminal
+    /// paths (poll, cancel, zombie eviction) become responsible for the release.
+    fn disarm(&mut self) {
+        self.released = true;
     }
 
     /// Release the slot on the normal path. Idempotent — safe to call twice.
@@ -763,6 +856,15 @@ impl ClusterSlotGuard {
                 .cluster_manager
                 .release_cluster(&self.group, &self.cluster)
                 .await;
+            if let Some(cap) = &self.capacity_store {
+                if let Err(e) = cap.release(&self.cluster.0, &self.query_id).await {
+                    self.metrics.on_coordination_failure("capacity_release");
+                    tracing::warn!(
+                        "CapacityStore release failed for query {}: {e}",
+                        self.query_id
+                    );
+                }
+            }
             self.metrics
                 .on_query_finished(&self.group.0, &self.cluster.0);
         }
@@ -772,15 +874,28 @@ impl ClusterSlotGuard {
 impl Drop for ClusterSlotGuard {
     fn drop(&mut self) {
         if !self.released {
-            // Cancellation path: the future was dropped while holding the slot.
-            // Spawn a best-effort release. record_query is not called here —
-            // there is no outcome to record.
+            // Fallback path: the guard was dropped without an explicit `release()` call
+            // (e.g. a future was cancelled mid-dispatch). We spawn a best-effort task to
+            // clean up the slot.
+            //
+            // Bounding note: this path is only reached on unclean drops (panics, task
+            // cancellations). The upstream `max_running_queries` gate constrains how many
+            // guards can be alive simultaneously, so the total number of concurrent
+            // best-effort tasks is bounded by the per-cluster concurrency limit.
             let mgr = self.cluster_manager.clone();
             let group = self.group.clone();
             let cluster = self.cluster.clone();
             let metrics = self.metrics.clone();
+            let cap = self.capacity_store.clone();
+            let qid = self.query_id.clone();
             tokio::spawn(async move {
                 let _ = mgr.release_cluster(&group, &cluster).await;
+                if let Some(cap) = cap {
+                    if let Err(e) = cap.release(&cluster.0, &qid).await {
+                        metrics.on_coordination_failure("capacity_release");
+                        tracing::warn!("CapacityStore release failed for query {qid}: {e}");
+                    }
+                }
                 metrics.on_query_finished(&group.0, &cluster.0);
             });
         }
@@ -893,6 +1008,7 @@ impl From<SyncOutcome> for QueryOutcome {
             engine_stats: o.engine_stats,
             guard_actions: vec![],
             was_guard_blocked: false,
+            queue_duration_ms: 0,
         }
     }
 }
@@ -917,7 +1033,7 @@ async fn setup_sync_query(
 ) -> Result<SyncQuerySetup> {
     let query_id = ProxyQueryId::new();
 
-    let (cluster_manager, group_fixups, group_default_tags) = {
+    let (cluster_manager, group_fixups, group_default_tags, cluster_configs) = {
         let live = state.live.read().await;
         (
             live.cluster_manager.clone(),
@@ -929,24 +1045,51 @@ async fn setup_sync_query(
                 .get(&group.0)
                 .cloned()
                 .unwrap_or_default(),
+            live.cluster_configs.clone(),
         )
     };
     let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
 
-    // Queue loop: spin until a cluster slot is available.
+    // Queue loop: spin until a cluster slot is available (both local and global).
+    // `wait_start` is this query's place in line for the fairness gate: queued
+    // queries enqueued before it (and still polling) get freed slots first.
+    let wait_start = Utc::now();
     let mut seq: u64 = 0;
     let (cluster_name, adapter) = loop {
+        if should_yield_to_older_queued(state, &cluster_manager, &group, Some(wait_start)).await {
+            queued_backoff_delay(seq).await;
+            seq += 1;
+            continue;
+        }
         match cluster_manager.acquire_cluster(&group).await? {
-            Some(name) => match state.adapter(&name.0).await {
-                Some(AdapterKind::Sync(a)) => break (name, DispatchAdapter::Sync(a)),
-                Some(AdapterKind::Async(a)) => break (name, DispatchAdapter::Async(a)),
-                None => {
-                    let _ = cluster_manager.release_cluster(&group, &name).await;
-                    return Err(QueryFluxError::Engine(format!(
-                        "No adapter for {group}/{name}"
-                    )));
+            Some(name) => {
+                match acquire_global_capacity(state, &cluster_manager, &group, &name, &query_id.0)
+                    .await
+                {
+                    CapacityGrant::Denied => {
+                        // Global capacity full or coordination unavailable (fail-closed) —
+                        // release local slot and retry with backoff.
+                        let _ = cluster_manager.release_cluster(&group, &name).await;
+                        queued_backoff_delay(seq).await;
+                        seq += 1;
+                        continue;
+                    }
+                    CapacityGrant::Granted => {}
                 }
-            },
+                match state.adapter(&name.0).await {
+                    Some(AdapterKind::Sync(a)) => break (name, DispatchAdapter::Sync(a)),
+                    Some(AdapterKind::Async(a)) => break (name, DispatchAdapter::Async(a)),
+                    None => {
+                        let _ = cluster_manager.release_cluster(&group, &name).await;
+                        if let Some(cap) = &state.capacity_store {
+                            let _ = cap.release(&name.0, &query_id.0).await;
+                        }
+                        return Err(QueryFluxError::Engine(format!(
+                            "No adapter for {group}/{name}"
+                        )));
+                    }
+                }
+            }
             None => {
                 queued_backoff_delay(seq).await;
                 seq += 1;
@@ -966,6 +1109,8 @@ async fn setup_sync_query(
         group.clone(),
         cluster_name.clone(),
         state.metrics.clone(),
+        state.capacity_store.clone(),
+        query_id.0.clone(),
     );
 
     let src_dialect = protocol.default_dialect();
@@ -1020,6 +1165,7 @@ async fn setup_sync_query(
                     engine_stats: None,
                     guard_actions: vec![],
                     was_guard_blocked: false,
+                    queue_duration_ms: 0,
                 },
             );
             slot.release().await;
@@ -1029,11 +1175,18 @@ async fn setup_sync_query(
 
     let was_translated = translated != sql;
 
-    let cluster_cfg = state.cluster_config_cloned(&cluster_name.0).await;
-    let credentials = state
+    let this_cluster_cfg = cluster_configs.get(&cluster_name.0).cloned();
+    let credentials = match state
         .identity_resolver
-        .resolve(auth_ctx, cluster_cfg.as_ref())
-        .await;
+        .resolve(auth_ctx, this_cluster_cfg.as_ref())
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            slot.release().await;
+            return Err(e);
+        }
+    };
 
     // Fallback interpolation: when the adapter does not support native params,
     // substitute `?` placeholders with typed literals now so the adapter receives
@@ -1353,21 +1506,22 @@ pub async fn execute_to_sink(
     sink: &mut impl ResultSink,
     auth_ctx: &AuthContext,
 ) -> Result<()> {
-    if !state.authorization.check(auth_ctx, &group.0).await {
+    let (authorization, guard_chain, group_guard_chain) = {
+        let live = state.live.read().await;
+        (
+            live.authorization.clone(),
+            live.guard_chain.clone(),
+            live.group_guard_chains.get(&group.0).cloned(),
+        )
+    };
+
+    if !authorization.check(auth_ctx, &group.0).await {
         let msg = format!(
             "user '{}' is not authorized to run queries on cluster group '{}'",
             auth_ctx.user, group.0
         );
         return sink.on_error(&msg).await;
     }
-
-    let (guard_chain, group_guard_chain) = {
-        let live = state.live.read().await;
-        (
-            live.guard_chain.clone(),
-            live.group_guard_chains.get(&group.0).cloned(),
-        )
-    };
 
     let mut setup = match setup_sync_query(
         state,
@@ -1427,6 +1581,7 @@ pub async fn execute_to_sink(
                         engine_stats: None,
                         guard_actions: all_actions,
                         was_guard_blocked: true,
+                        queue_duration_ms: 0,
                     },
                 );
                 return sink.on_error(&deny_reason).await;

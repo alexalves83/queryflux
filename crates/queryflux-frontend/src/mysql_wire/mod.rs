@@ -18,7 +18,7 @@
 //! protocol on the fly via `on_schema` / `on_batch`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arrow::array::Array;
@@ -41,7 +41,7 @@ use queryflux_core::{
 
 use crate::dispatch::{execute_to_sink, ResultSink};
 use crate::state::AppState;
-use crate::FrontendListenerTrait;
+use crate::{FrontendListenerTrait, ShutdownRx};
 
 // ── MySQL command bytes ───────────────────────────────────────────────────────
 
@@ -89,37 +89,65 @@ static CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
 pub struct MysqlWireFrontend {
     state: Arc<AppState>,
     port: u16,
+    max_connections: Option<usize>,
 }
 
 impl MysqlWireFrontend {
-    pub fn new(state: Arc<AppState>, port: u16) -> Self {
-        Self { state, port }
+    pub fn new(state: Arc<AppState>, port: u16, max_connections: Option<usize>) -> Self {
+        Self {
+            state,
+            port,
+            max_connections,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl FrontendListenerTrait for MysqlWireFrontend {
-    async fn listen(&self) -> Result<()> {
+    async fn listen(&self, mut shutdown: ShutdownRx) -> Result<()> {
         let addr = format!("0.0.0.0:{}", self.port);
         info!("MySQL wire frontend listening on {addr}");
         let listener = TcpListener::bind(&addr)
             .await
             .map_err(|e| QueryFluxError::Other(e.into()))?;
 
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_conn = self.max_connections.filter(|&l| l > 0);
+
         loop {
-            let (stream, peer) = listener
-                .accept()
-                .await
-                .map_err(|e| QueryFluxError::Other(e.into()))?;
-            debug!(peer = %peer, "MySQL wire: new connection");
-            let state = self.state.clone();
-            let conn_id = CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-            tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, state, conn_id).await {
-                    debug!(conn_id, "MySQL wire connection closed: {e}");
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, peer) = result.map_err(|e| QueryFluxError::Other(e.into()))?;
+                    if let Some(limit) = max_conn {
+                        if active.load(Ordering::Relaxed) >= limit {
+                            tracing::warn!(peer = %peer, "MySQL wire: rejecting connection — at limit {limit}");
+                            drop(stream);
+                            continue;
+                        }
+                    }
+                    debug!(peer = %peer, "MySQL wire: new connection");
+                    let state = self.state.clone();
+                    let conn_id = CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+                    let active = active.clone();
+                    active.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(stream, state, conn_id).await {
+                            debug!(conn_id, "MySQL wire connection closed: {e}");
+                        }
+                        active.fetch_sub(1, Ordering::Relaxed);
+                    });
                 }
-            });
+                _ = shutdown.changed() => {
+                    info!("MySQL wire frontend: shutdown signal received, stopping accept loop");
+                    break;
+                }
+            }
         }
+        // Drain: wait for all in-flight connections to finish before returning.
+        while active.load(Ordering::Relaxed) > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Ok(())
     }
 }
 
@@ -320,12 +348,12 @@ async fn handle_com_query<W: AsyncWriteExt + Unpin>(
 
     let protocol = FrontendProtocol::MySqlWire;
 
-    // Authenticate — derive AuthContext from session (Phase 1: NoneAuthProvider).
     let creds = Credentials {
         username: session.user().map(|s| s.to_string()),
         ..Default::default()
     };
-    let auth_ctx = match state.auth_provider.authenticate(&creds).await {
+    let auth_provider = state.live.read().await.auth_provider.clone();
+    let auth_ctx = match auth_provider.authenticate(&creds).await {
         Ok(ctx) => ctx,
         Err(e) => {
             write_packet(writer, start_seq, &build_err(1045, &e.to_string())).await?;

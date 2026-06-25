@@ -506,14 +506,32 @@ pub struct QueryFluxConfig {
     /// Omit or set to `null` to keep history indefinitely.
     #[serde(default)]
     pub query_history_retention_days: Option<u64>,
-    /// When true and Snowflake HTTP is enabled, require `frontends.snowflakeHttp.sessionAffinityAcknowledged`.
-    #[serde(default)]
-    pub enforce_snowflake_http_session_affinity: bool,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Enable distributed (multi-instance) mode. When `true`, QueryFlux enforces global
+    /// capacity limits and config propagation via the persistence backend.
+    /// Requires `persistence.type = postgres`. Auto-detected as `true` when persistence
+    /// is Postgres; set explicitly to `false` to opt out while still using Postgres persistence.
+    #[serde(default)]
+    pub distributed: Option<bool>,
+    /// Maximum seconds to wait for in-flight queries to drain during graceful shutdown.
+    /// After this timeout, the process exits regardless of remaining work.
+    /// Defaults to 30 seconds.
+    #[serde(default)]
+    pub shutdown_drain_timeout_secs: Option<u64>,
+    /// OpenTelemetry OTLP exporter endpoint (e.g. `http://localhost:4317`).
+    /// When set, QueryFlux exports distributed traces via gRPC OTLP.
+    /// Requires the binary to be built with `--features otlp`.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
 }
 
 impl QueryFluxConfig {
+    /// Seconds to wait for in-flight queries to drain on shutdown. Defaults to 30.
+    pub fn shutdown_drain_timeout_secs(&self) -> u64 {
+        self.shutdown_drain_timeout_secs.unwrap_or(30)
+    }
+
     /// Interval for **periodic** background reload of routing rules and cluster/group config from Postgres.
     ///
     /// - [`None`](Option::None) (field omitted in YAML) → **Some(30)**.
@@ -525,6 +543,29 @@ impl QueryFluxConfig {
             Some(0) => None,
             Some(n) => Some(n),
         }
+    }
+
+    /// Resolve whether distributed mode is active and validate the configuration.
+    ///
+    /// `backend_supports_coordination` is whether a `DistributedBackendStore`
+    /// is wired at startup and its `supports_distributed_coordination()` returns
+    /// `true` (Postgres today). Backends that only implement `BackendStore` pass
+    /// `false`. Distributed mode defaults to on whenever coordination is
+    /// available; set `distributed: false` to opt out explicitly.
+    ///
+    /// Returns `Err` when distributed mode is requested but the persistence
+    /// backend cannot coordinate across replicas.
+    pub fn resolve_distributed(&self, backend_supports_coordination: bool) -> Result<bool, String> {
+        let distributed = self.distributed.unwrap_or(backend_supports_coordination);
+        if distributed && !backend_supports_coordination {
+            return Err(
+                "Distributed mode requires a persistence backend that supports \
+                 multi-replica coordination (e.g. persistence.type = postgres). \
+                 InMemory persistence cannot coordinate across replicas."
+                    .to_string(),
+            );
+        }
+        Ok(distributed)
     }
 }
 
@@ -542,7 +583,7 @@ pub struct FrontendsConfig {
     #[serde(default)]
     pub flight_sql: Option<FrontendConfig>,
     #[serde(default)]
-    pub snowflake_http: Option<FrontendConfig>,
+    pub snowflake_http: Option<SnowflakeHttpFrontendConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -551,15 +592,12 @@ pub struct FrontendConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub port: u16,
-    /// Operator assertion: load balancer provides session affinity for Snowflake HTTP wire.
+    /// Maximum number of concurrent connections (TCP-based frontends) or concurrent in-flight
+    /// requests (HTTP-based frontends like Trino HTTP) this frontend will accept. For HTTP
+    /// frontends the limit is enforced via `tower::ConcurrencyLimitLayer`, so keep-alive clients
+    /// that are idle between requests do not count against it. `None` or `0` = unlimited.
     #[serde(default)]
-    pub session_affinity_acknowledged: bool,
-    /// Snowflake HTTP wire — max session lifetime in seconds from login. Omitted → 86400. `0` = unbounded.
-    #[serde(default)]
-    pub snowflake_session_max_age_secs: Option<u64>,
-    /// Snowflake HTTP wire — idle timeout in seconds. Omitted → 14400. `0` = no idle limit.
-    #[serde(default)]
-    pub snowflake_session_idle_timeout_secs: Option<u64>,
+    pub max_connections: Option<usize>,
 }
 
 impl Default for FrontendConfig {
@@ -567,11 +605,43 @@ impl Default for FrontendConfig {
         Self {
             enabled: true,
             port: 8080,
-            session_affinity_acknowledged: false,
-            snowflake_session_max_age_secs: None,
-            snowflake_session_idle_timeout_secs: None,
+            max_connections: None,
         }
     }
+}
+
+/// Config for the Snowflake frontend (HTTP wire v1 + SQL API v2 on the same port).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnowflakeHttpFrontendConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub port: u16,
+    /// Maximum number of concurrent in-flight HTTP requests this frontend will accept.
+    /// Enforced via `tower::ConcurrencyLimitLayer` — idle keep-alive clients do not count.
+    /// `None` or `0` = unlimited.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    /// Must be set to `true` when running multiple QueryFlux replicas to acknowledge that
+    /// the load balancer is configured for sticky session affinity. A warning is logged at
+    /// startup when this is `false`, because HTTP wire v1 sessions are process-local and
+    /// clients will break if requests are routed to a different replica.
+    #[serde(default)]
+    pub session_affinity_acknowledged: bool,
+    /// Maximum session lifetime in seconds. 0 = no limit. Default: 86400 (24 h).
+    #[serde(default = "default_session_max_age_secs")]
+    pub session_max_age_secs: u64,
+    /// Session idle timeout in seconds. 0 = no limit. Default: 14400 (4 h).
+    #[serde(default = "default_session_idle_timeout_secs")]
+    pub session_idle_timeout_secs: u64,
+}
+
+fn default_session_max_age_secs() -> u64 {
+    86400
+}
+
+fn default_session_idle_timeout_secs() -> u64 {
+    14400
 }
 
 fn default_true() -> bool {
@@ -596,6 +666,20 @@ pub struct PostgresPersistenceConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub database: Option<String>,
+    /// Max connections in the sqlx pool (`poolSize` in YAML). Omit for the
+    /// sqlx default (10). The pool serves the dispatch hot path (capacity
+    /// acquire/release per query) plus persistence, admin, LISTEN/NOTIFY,
+    /// and sweeps — raise this before adding replicas under high QPS.
+    #[serde(default)]
+    pub pool_size: Option<u32>,
+    /// Max seconds to wait for a connection from the pool before returning an error.
+    /// Defaults to 30 seconds.
+    #[serde(default)]
+    pub acquire_timeout_secs: Option<u64>,
+    /// Postgres `statement_timeout` set on each connection (seconds). Prevents
+    /// runaway queries from holding pool connections indefinitely. Defaults to 60s.
+    #[serde(default)]
+    pub statement_timeout_secs: Option<u64>,
 }
 
 impl PostgresPersistenceConfig {
@@ -682,6 +766,12 @@ pub struct AdminApiConfig {
     /// Ignored once the password has been changed via the web UI (DB hash takes precedence).
     #[serde(default = "default_admin_password")]
     pub password: String,
+    /// Allowed CORS origins for the admin API. When set, only these origins may
+    /// make cross-origin requests. When empty or omitted, all origins are allowed
+    /// (a startup warning is logged because `allow_origin(Any)` on the admin API
+    /// is a security risk in production).
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 fn default_admin_port() -> u16 {
@@ -702,6 +792,7 @@ impl Default for AdminApiConfig {
             port: 9000,
             username: default_admin_username(),
             password: default_admin_password(),
+            cors_allowed_origins: Vec::new(),
         }
     }
 }
@@ -1327,6 +1418,7 @@ guardrails:
             password: Some("secret@x".into()),
             database: Some("queryflux".into()),
             url: None,
+            ..Default::default()
         };
         let u = c.connection_url().unwrap();
         assert!(u.starts_with("postgres://"));
@@ -1374,5 +1466,93 @@ queryflux:
             }
             _ => panic!("expected postgres"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Distributed mode config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn distributed_defaults_to_none() {
+        let cfg: ProxyConfig = serde_yaml::from_str("queryflux: {}").unwrap();
+        assert!(cfg.queryflux.distributed.is_none());
+    }
+
+    #[test]
+    fn distributed_explicit_true() {
+        let yaml = "queryflux:\n  distributed: true\n";
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.queryflux.distributed, Some(true));
+    }
+
+    #[test]
+    fn distributed_explicit_false() {
+        let yaml = "queryflux:\n  distributed: false\n";
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.queryflux.distributed, Some(false));
+    }
+
+    #[test]
+    fn distributed_true_with_in_memory_persistence_is_invalid_at_runtime() {
+        let yaml = r#"
+queryflux:
+  distributed: true
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.queryflux.distributed, Some(true));
+        assert!(matches!(
+            cfg.queryflux.persistence,
+            PersistenceConfig::InMemory
+        ));
+    }
+
+    #[test]
+    fn distributed_true_with_postgres_is_valid_at_runtime() {
+        let yaml = r#"
+queryflux:
+  distributed: true
+  persistence:
+    type: postgres
+    url: postgres://a:b@localhost:5432/db
+"#;
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.queryflux.distributed, Some(true));
+        assert!(matches!(
+            cfg.queryflux.persistence,
+            PersistenceConfig::Postgres { .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_distributed validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_distributed_auto_detects_postgres() {
+        let cfg: ProxyConfig = serde_yaml::from_str("queryflux: {}").unwrap();
+        assert!(cfg.queryflux.resolve_distributed(true).unwrap());
+        assert!(!cfg.queryflux.resolve_distributed(false).unwrap());
+    }
+
+    #[test]
+    fn resolve_distributed_explicit_true_with_postgres_ok() {
+        let yaml = "queryflux:\n  distributed: true\n";
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.queryflux.resolve_distributed(true).unwrap());
+    }
+
+    #[test]
+    fn resolve_distributed_explicit_true_without_postgres_fails() {
+        let yaml = "queryflux:\n  distributed: true\n";
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.queryflux.resolve_distributed(false).unwrap_err();
+        assert!(err.contains("InMemory persistence cannot coordinate"));
+    }
+
+    #[test]
+    fn resolve_distributed_explicit_false_with_postgres_ok() {
+        let yaml = "queryflux:\n  distributed: false\n";
+        let cfg: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!cfg.queryflux.resolve_distributed(true).unwrap());
     }
 }

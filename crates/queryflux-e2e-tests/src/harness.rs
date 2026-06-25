@@ -23,6 +23,7 @@ use queryflux_auth::{
 use queryflux_cluster_manager::{
     cluster_state::ClusterState, simple::SimpleClusterGroupManager, strategy::strategy_from_config,
 };
+use queryflux_core::config::SnowflakeHttpFrontendConfig;
 use queryflux_core::{
     error::Result as QfResult,
     query::{ClusterGroupName, ClusterName, EngineType},
@@ -286,6 +287,8 @@ impl TestHarness {
             group_order,
             group_translation_scripts: HashMap::new(),
             group_default_tags: HashMap::new(),
+            auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
+            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
         };
         let records = Arc::new(Mutex::new(Vec::<QueryRecord>::new()));
         let state = Arc::new(AppState {
@@ -296,19 +299,30 @@ impl TestHarness {
             metrics: Arc::new(CapturingMetrics {
                 records: records.clone(),
             }),
-            auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
-            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
             identity_resolver: Arc::new(BackendIdentityResolver::new()),
-            snowflake_sessions:
-                queryflux_frontend::snowflake::http::session_store::SnowflakeSessionStore::new(
-                    Default::default(),
-                ),
+            capacity_store: None,
+            queue_coordinator: None,
+            instance_id: "test-harness".to_string(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build shared http client"),
         });
 
-        let trino_fe = TrinoHttpFrontend::new(state.clone(), port);
-        let snowflake_fe = SnowflakeFrontend::new(state, port);
-        // Serve both Trino HTTP (/v1/statement) and Snowflake HTTP (/session, /queries) on the
-        // same port so query-params e2e tests can use the Snowflake protocol with bindings.
+        let trino_fe = TrinoHttpFrontend::new(state.clone(), port, None);
+        let snowflake_fe = SnowflakeFrontend::new(
+            state,
+            SnowflakeHttpFrontendConfig {
+                enabled: true,
+                port,
+                max_connections: None,
+                session_affinity_acknowledged: true,
+                session_max_age_secs: 86400,
+                session_idle_timeout_secs: 14400,
+            },
+        );
+        // Serve both Trino HTTP (/v1/statement) and Snowflake (wire v1 + SQL API v2)
+        // on the same port so query-params e2e tests can use the Snowflake protocol with bindings.
         let router: Router = trino_fe.router().merge(snowflake_fe.router());
         let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -412,4 +426,290 @@ async fn is_lakekeeper_ready(url: &str) -> bool {
     let host = parsed.host_str().unwrap_or("localhost");
     let port = parsed.port().unwrap_or(8181);
     port_is_open(host, port).await
+}
+
+// ---------------------------------------------------------------------------
+// WireTestHarness — Snowflake HTTP wire v1 + SQL API v2 on a DuckDB backend.
+//
+// Uses short session TTLs so expiry tests run fast without real-time sleeps.
+// ---------------------------------------------------------------------------
+
+pub struct WireTestHarness {
+    pub port: u16,
+    pub session_idle_timeout_secs: u64,
+    pub session_max_age_secs: u64,
+    _shutdown_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+impl WireTestHarness {
+    /// Create a wire harness. `session_max_age_secs` / `session_idle_timeout_secs`
+    /// are passed through to the session store so TTL tests can use small values.
+    pub async fn new(session_max_age_secs: u64, session_idle_timeout_secs: u64) -> Result<Self> {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("error")
+            .try_init();
+
+        // --- DuckDB only ---
+        let group = ClusterGroupName(GROUP_DUCKDB.to_string());
+        let cluster = ClusterName("duckdb-wire-1".to_string());
+        let cs = Arc::new(ClusterState::new(
+            cluster.clone(),
+            group.clone(),
+            None,
+            None,
+            EngineType::DuckDb,
+            None,
+            4,
+            true,
+        ));
+        let adapter = Arc::new(
+            DuckDbAdapter::new(
+                cluster.clone(),
+                group.clone(),
+                DuckDbConfig {
+                    database_path: None,
+                    motherduck_token: None,
+                },
+            )
+            .map_err(|e| anyhow!("DuckDB adapter: {e}"))?,
+        );
+
+        let mut group_states: HashMap<ClusterGroupName, _> = HashMap::new();
+        group_states.insert(group.clone(), (vec![cs], strategy_from_config(None)));
+        let mut adapters: HashMap<String, AdapterKind> = HashMap::new();
+        adapters.insert(cluster.0.clone(), AdapterKind::Sync(adapter));
+
+        let duckdb_group = group.clone();
+        let router = Box::new(ProtocolBasedRouter {
+            trino_http: None,
+            postgres_wire: None,
+            mysql_wire: None,
+            clickhouse_http: None,
+            flight_sql: None,
+            snowflake_http: Some(duckdb_group.clone()),
+            snowflake_sql_api: Some(duckdb_group),
+        });
+
+        let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
+        let translation = Arc::new(TranslationService::disabled());
+        let router_chain = RouterChain::new(vec![router], group.clone());
+
+        let tmp = TcpListener::bind("127.0.0.1:0").await?;
+        let port = tmp.local_addr()?.port();
+        drop(tmp);
+
+        let live_config = LiveConfig {
+            router_chain,
+            guard_chain: None,
+            group_guard_chains: HashMap::new(),
+            cluster_manager,
+            adapters,
+            health_check_targets: vec![],
+            cluster_configs: HashMap::new(),
+            group_members: HashMap::from([(GROUP_DUCKDB.to_string(), vec![cluster.0.clone()])]),
+            group_order: vec![GROUP_DUCKDB.to_string()],
+            group_translation_scripts: HashMap::new(),
+            group_default_tags: HashMap::new(),
+            auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
+            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
+        };
+
+        let state = Arc::new(AppState {
+            external_address: format!("http://127.0.0.1:{port}"),
+            live: Arc::new(tokio::sync::RwLock::new(live_config)),
+            persistence: Arc::new(InMemoryPersistence::new()),
+            translation,
+            metrics: Arc::new(NullMetrics),
+            identity_resolver: Arc::new(BackendIdentityResolver::new()),
+            capacity_store: None,
+            queue_coordinator: None,
+            instance_id: "wire-test-harness".to_string(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build http client"),
+        });
+
+        let snowflake_fe = SnowflakeFrontend::new(
+            state,
+            SnowflakeHttpFrontendConfig {
+                enabled: true,
+                port,
+                max_connections: None,
+                session_affinity_acknowledged: true,
+                session_max_age_secs,
+                session_idle_timeout_secs,
+            },
+        );
+
+        let router = snowflake_fe.router();
+        let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .ok();
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        Ok(Self {
+            port,
+            session_idle_timeout_secs,
+            session_max_age_secs,
+            _shutdown_tx: shutdown_tx,
+        })
+    }
+
+    /// Create a wire harness backed by StarRocks instead of DuckDB.
+    /// Returns `Ok(None)` when StarRocks is not reachable (tests can skip cleanly).
+    pub async fn new_starrocks(
+        session_max_age_secs: u64,
+        session_idle_timeout_secs: u64,
+    ) -> Result<Option<Self>> {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("error")
+            .try_init();
+
+        let sr_url = std::env::var("STARROCKS_URL")
+            .unwrap_or_else(|_| "mysql://root@localhost:9030".to_string());
+        if !is_starrocks_ready(&sr_url).await {
+            return Ok(None);
+        }
+
+        let group = ClusterGroupName(GROUP_STARROCKS.to_string());
+        let cluster = ClusterName("starrocks-wire-1".to_string());
+        let cs = Arc::new(ClusterState::new(
+            cluster.clone(),
+            group.clone(),
+            None,
+            None,
+            EngineType::StarRocks,
+            Some(sr_url.clone()),
+            8,
+            true,
+        ));
+        let adapter = Arc::new(
+            StarRocksAdapter::new(
+                cluster.clone(),
+                group.clone(),
+                queryflux_engine_adapters::starrocks::StarRocksConfig {
+                    endpoint: sr_url,
+                    auth: None,
+                    pool_size: 2,
+                },
+            )
+            .map_err(|e| anyhow!("StarRocks adapter: {e}"))?,
+        );
+
+        let mut group_states: HashMap<ClusterGroupName, _> = HashMap::new();
+        group_states.insert(group.clone(), (vec![cs], strategy_from_config(None)));
+        let mut adapters: HashMap<String, AdapterKind> = HashMap::new();
+        adapters.insert(cluster.0.clone(), AdapterKind::Sync(adapter));
+
+        let sr_group = group.clone();
+        let router = Box::new(ProtocolBasedRouter {
+            trino_http: None,
+            postgres_wire: None,
+            mysql_wire: None,
+            clickhouse_http: None,
+            flight_sql: None,
+            snowflake_http: Some(sr_group.clone()),
+            snowflake_sql_api: Some(sr_group),
+        });
+
+        let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
+        let translation = Arc::new(TranslationService::disabled());
+        let router_chain = RouterChain::new(vec![router], group.clone());
+
+        let tmp = TcpListener::bind("127.0.0.1:0").await?;
+        let port = tmp.local_addr()?.port();
+        drop(tmp);
+
+        let live_config = LiveConfig {
+            router_chain,
+            guard_chain: None,
+            group_guard_chains: HashMap::new(),
+            cluster_manager,
+            adapters,
+            health_check_targets: vec![],
+            cluster_configs: HashMap::new(),
+            group_members: HashMap::from([(GROUP_STARROCKS.to_string(), vec![cluster.0.clone()])]),
+            group_order: vec![GROUP_STARROCKS.to_string()],
+            group_translation_scripts: HashMap::new(),
+            group_default_tags: HashMap::new(),
+            auth_provider: Arc::new(NoneAuthProvider::new(false)) as Arc<dyn AuthProvider>,
+            authorization: Arc::new(AllowAllAuthorization) as Arc<dyn AuthorizationChecker>,
+        };
+
+        let state = Arc::new(AppState {
+            external_address: format!("http://127.0.0.1:{port}"),
+            live: Arc::new(tokio::sync::RwLock::new(live_config)),
+            persistence: Arc::new(InMemoryPersistence::new()),
+            translation,
+            metrics: Arc::new(NullMetrics),
+            identity_resolver: Arc::new(BackendIdentityResolver::new()),
+            capacity_store: None,
+            queue_coordinator: None,
+            instance_id: "wire-starrocks-harness".to_string(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build http client"),
+        });
+
+        let snowflake_fe = SnowflakeFrontend::new(
+            state,
+            SnowflakeHttpFrontendConfig {
+                enabled: true,
+                port,
+                max_connections: None,
+                session_affinity_acknowledged: true,
+                session_max_age_secs,
+                session_idle_timeout_secs,
+            },
+        );
+
+        let router = snowflake_fe.router();
+        let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .ok();
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        Ok(Some(Self {
+            port,
+            session_idle_timeout_secs,
+            session_max_age_secs,
+            _shutdown_tx: shutdown_tx,
+        }))
+    }
+
+    pub fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+// Minimal no-op metrics sink for WireTestHarness (avoids the Mutex overhead of CapturingMetrics).
+struct NullMetrics;
+
+#[async_trait]
+impl MetricsStore for NullMetrics {
+    async fn record_query(&self, _r: QueryRecord) -> QfResult<()> {
+        Ok(())
+    }
+
+    async fn record_cluster_snapshot(&self, _s: ClusterSnapshot) -> QfResult<()> {
+        Ok(())
+    }
 }

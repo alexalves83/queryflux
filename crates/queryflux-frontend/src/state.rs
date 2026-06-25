@@ -18,11 +18,9 @@ use queryflux_engine_adapters::AdapterKind;
 use queryflux_fingerprint::{polyglot_dialect, rich_fingerprint};
 use queryflux_guardrails::GuardChain;
 use queryflux_metrics::{GuardAction, MetricsStore, QueryRecord};
-use queryflux_persistence::Persistence;
+use queryflux_persistence::{CapacityStore, Persistence, QueueCoordinator};
 use queryflux_routing::chain::{RouterChain, RoutingTrace};
 use queryflux_translation::TranslationService;
-
-use crate::snowflake::http::session_store::SnowflakeSessionStore;
 
 /// Everything that can be hot-reloaded from the DB without restarting the proxy.
 ///
@@ -56,6 +54,11 @@ pub struct LiveConfig {
     /// group_name → default tags configured on the group.
     /// Merged with session tags at dispatch time; session tags win on key conflicts.
     pub group_default_tags: HashMap<String, QueryTags>,
+    /// Verifies client identity — hot-reloaded when security config changes via admin API.
+    pub auth_provider: Arc<dyn AuthProvider>,
+    /// Checks whether an authenticated user may access a cluster group — hot-reloaded
+    /// when security config changes via admin API.
+    pub authorization: Arc<dyn AuthorizationChecker>,
 }
 
 /// Shared application state — passed to every handler via `axum::extract::State`.
@@ -63,21 +66,26 @@ pub struct LiveConfig {
 pub struct AppState {
     /// The external URL clients use to reach QueryFlux (used for nextUri rewriting).
     pub external_address: String,
-    /// Hot-reloadable: routing rules + cluster registry.
+    /// Hot-reloadable: routing rules, cluster registry, auth, authorization.
     pub live: Arc<tokio::sync::RwLock<LiveConfig>>,
     // Static (never reloaded):
     pub persistence: Arc<dyn Persistence>,
     pub translation: Arc<TranslationService>,
     pub metrics: Arc<dyn MetricsStore>,
-    /// Verifies client identity. Phase 1: `NoneAuthProvider` (network-trust, no crypto).
-    pub auth_provider: Arc<dyn AuthProvider>,
-    /// Checks whether an authenticated user may access a cluster group.
-    /// Phase 1: `AllowAllAuthorization` (permit everything, today's behavior).
-    pub authorization: Arc<dyn AuthorizationChecker>,
     /// Resolves per-user `QueryCredentials` from `AuthContext` + cluster `queryAuth` config.
     pub identity_resolver: Arc<BackendIdentityResolver>,
-    /// Snowflake HTTP wire sessions (in-memory, process-local). See Snowflake frontend docs.
-    pub snowflake_sessions: Arc<SnowflakeSessionStore>,
+    /// Global cluster capacity coordination — ensures `max_running_queries` is enforced
+    /// across all replicas, not just per-process. `None` in InMemory mode (local atomics
+    /// are the source of truth).
+    pub capacity_store: Option<Arc<dyn CapacityStore>>,
+    /// Prevents multiple replicas from dequeuing the same queued query. `None` in InMemory mode.
+    pub queue_coordinator: Option<Arc<dyn QueueCoordinator>>,
+    /// Unique identifier for this replica instance, used for capacity leases and queue claims.
+    pub instance_id: String,
+    /// Shared HTTP client for backend-facing fire-and-forget calls (e.g. cancel forwarding).
+    /// Pre-configured with a 30-second timeout; reusing the client avoids per-request
+    /// connection-pool churn.
+    pub http_client: reqwest::Client,
 }
 
 /// Stable per-query metadata that does not change across the query's lifecycle.
@@ -119,6 +127,9 @@ pub struct QueryOutcome {
     pub guard_actions: Vec<GuardAction>,
     /// True if any guard returned Deny — fast filter for Studio.
     pub was_guard_blocked: bool,
+    /// Milliseconds spent waiting in the proxy queue before dispatch.
+    /// Zero for queries that were dispatched immediately.
+    pub queue_duration_ms: u64,
 }
 
 impl AppState {
@@ -141,6 +152,27 @@ impl AppState {
                     .any(|name| matches!(live.adapters.get(name), Some(AdapterKind::Async(_))))
             })
             .unwrap_or(false)
+    }
+
+    /// Release a query's cluster capacity slot — local counter, global Postgres lease,
+    /// and metrics. Call this **once** at every terminal path (success, failure, cancel,
+    /// error) instead of manually calling `release_cluster` + `capacity_store.release`
+    /// + `on_query_finished` separately.
+    pub async fn release_query_slot(
+        &self,
+        group: &ClusterGroupName,
+        cluster: &ClusterName,
+        query_id: &str,
+    ) {
+        self.metrics.on_query_finished(&group.0, &cluster.0);
+        let cluster_manager = self.live.read().await.cluster_manager.clone();
+        let _ = cluster_manager.release_cluster(group, cluster).await;
+        if let Some(cap) = &self.capacity_store {
+            if let Err(e) = cap.release(&cluster.0, query_id).await {
+                self.metrics.on_coordination_failure("capacity_release");
+                tracing::warn!("CapacityStore release failed for query {query_id}: {e}");
+            }
+        }
     }
 
     /// Fire-and-forget: build a `QueryRecord` and write it to the metrics store asynchronously.
@@ -193,7 +225,7 @@ impl AppState {
                 .routing_trace
                 .as_ref()
                 .and_then(|t| serde_json::to_value(t).ok()),
-            queue_duration_ms: 0,
+            queue_duration_ms: outcome.queue_duration_ms,
             execution_duration_ms: outcome.execution_ms,
             rows_returned: outcome.rows,
             error_message: outcome.error,

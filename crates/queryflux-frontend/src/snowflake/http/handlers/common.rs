@@ -1,10 +1,8 @@
 use std::io::Read;
 
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::HeaderMap;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
-use serde_json::json;
 use serde_json::Value;
 
 /// Snowflake clients (Python connector, JDBC, etc.) send `Content-Encoding: gzip` and gzip the
@@ -35,38 +33,12 @@ pub fn parse_snowflake_json_body(headers: &HeaderMap, body: &Bytes) -> Result<Va
     serde_json::from_slice(&decoded).map_err(|e| e.to_string())
 }
 
-/// Extract the Snowflake token from the Authorization header.
-/// Expected format: `Authorization: Snowflake Token="{token}"`
+/// Extract the session token from `Authorization: Snowflake Token="<token>"`.
+/// Returns `None` if the header is absent or does not match the expected format.
 pub fn extract_snowflake_token(headers: &HeaderMap) -> Option<String> {
-    let auth = headers.get("authorization")?.to_str().ok()?;
-    // Handle both `Snowflake Token="..."` and `Snowflake Token=...`
-    let rest = auth.strip_prefix("Snowflake Token=")?;
-    let token = rest.trim_matches('"');
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
-    }
-}
-
-/// Build a Snowflake-style JSON error response.
-///
-/// **Always uses HTTP 200** with `success: false` in the body. The official Snowflake Python
-/// connector treats many non-2xx status codes as *retryable* during `login-request` (including
-/// 400, 403, and all 5xx — see `is_retryable_http_code` in `snowflake.connector.network`).
-/// Returning 502/400 for configuration errors caused errno **251012** ("Login request is retryable")
-/// and then **250001** after retries. Real Snowflake often responds with 200 + JSON `success: false`.
-pub fn sf_error(_status: StatusCode, code: u64, message: &str) -> Response {
-    (
-        StatusCode::OK,
-        axum::Json(json!({
-            "data": null,
-            "code": code.to_string(),
-            "message": message,
-            "success": false
-        })),
-    )
-        .into_response()
+    let value = headers.get("authorization")?.to_str().ok()?;
+    let stripped = value.trim().strip_prefix("Snowflake Token=")?;
+    Some(stripped.trim_matches('"').to_string())
 }
 
 #[cfg(test)]

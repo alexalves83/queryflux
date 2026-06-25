@@ -1,15 +1,12 @@
-//! Minimal Snowflake HTTP client for e2e tests.
+//! Minimal Snowflake SQL API v2 client for e2e tests.
 //!
-//! Covers the two endpoints exercised by query-params tests:
-//!   POST /session/v1/login-request   → returns a session token
-//!   POST /queries/v1/query-request   → executes SQL with optional parameterBindings
+//! Uses the stateless SQL API v2 endpoint:
+//!   POST /api/v2/statements  → executes SQL with optional bindings, returns jsonv2
 //!
-//! Results are decoded from the `rowsetBase64` field (Arrow IPC stream, base64-encoded).
+//! No session management needed — each request is self-contained with Bearer auth
+//! (or no auth when `NoneAuthProvider` is configured in the test harness).
 
 use anyhow::{anyhow, Result};
-use arrow::array::Array;
-use arrow::ipc::reader::StreamReader;
-use base64::Engine as _;
 use reqwest::Client;
 use serde_json::{json, Value};
 
@@ -18,7 +15,7 @@ pub struct SnowflakeClient {
     base_url: String,
 }
 
-/// Decoded query result from a Snowflake HTTP response.
+/// Decoded query result from a Snowflake SQL API v2 response.
 pub struct SfQueryResult {
     /// `true` when the query succeeded.
     pub success: bool,
@@ -42,65 +39,29 @@ impl SnowflakeClient {
         }
     }
 
-    /// Authenticate and return a session token. Uses `NoneAuthProvider` (no real credentials).
-    pub async fn login(&self) -> Result<String> {
-        let body = json!({
-            "data": {
-                "LOGIN_NAME": "test",
-                "PASSWORD": "",
-                "CLIENT_APP_ID": "qf-e2e-test",
-                "CLIENT_APP_VERSION": "1.0"
-            }
-        });
-
-        let resp = self
-            .client
-            .post(format!("{}/session/v1/login-request", self.base_url))
-            .json(&body)
-            .send()
-            .await?
-            .json::<Value>()
-            .await?;
-
-        let success = resp["success"].as_bool().unwrap_or(false);
-        if !success {
-            return Err(anyhow!("Snowflake login failed: {resp}"));
-        }
-        resp["data"]["token"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("Login response missing data.token: {resp}"))
-    }
-
-    /// Execute SQL with optional Snowflake-style parameter bindings.
+    /// Execute SQL with optional Snowflake-style parameter bindings via the SQL API v2.
     ///
     /// `bindings` format mirrors the Snowflake wire protocol:
     /// ```json
     /// { "1": {"type": "FIXED", "value": "42"} }
     /// ```
-    pub async fn query(
-        &self,
-        token: &str,
-        sql: &str,
-        bindings: Option<Value>,
-    ) -> Result<SfQueryResult> {
-        let mut body = json!({"sqlText": sql});
+    pub async fn query(&self, sql: &str, bindings: Option<Value>) -> Result<SfQueryResult> {
+        let mut body = json!({"statement": sql});
         if let Some(b) = bindings {
-            body["parameterBindings"] = b;
+            body["bindings"] = b;
         }
 
         let resp = self
             .client
-            .post(format!("{}/queries/v1/query-request", self.base_url))
-            .header("Authorization", format!("Snowflake Token=\"{token}\""))
+            .post(format!("{}/api/v2/statements", self.base_url))
             .json(&body)
             .send()
             .await?
             .json::<Value>()
             .await?;
 
-        let success = resp["success"].as_bool().unwrap_or(false);
-        if !success {
+        // SQL API v2 success responses have no top-level `code` field; errors always do.
+        if resp.get("code").is_some() {
             return Ok(SfQueryResult {
                 success: false,
                 error: resp["message"].as_str().map(|s| s.to_string()),
@@ -109,96 +70,41 @@ impl SnowflakeClient {
             });
         }
 
-        let data = &resp["data"];
-        let total_rows = data["total"].as_u64().unwrap_or(0);
-        let rows = if let Some(b64) = data["rowsetBase64"].as_str() {
-            decode_rowset(b64)?
-        } else {
-            vec![]
-        };
+        let num_rows = resp["resultSetMetaData"]["numRows"].as_u64().unwrap_or(0);
+        let rows = decode_jsonv2_rows(&resp)?;
 
         Ok(SfQueryResult {
             success: true,
             error: None,
-            total_rows,
+            total_rows: num_rows,
             rows,
         })
     }
 }
 
-/// Decode a base64-encoded Arrow IPC stream into row-major string values.
-fn decode_rowset(b64: &str) -> Result<Vec<Vec<Option<String>>>> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|e| anyhow!("base64 decode failed: {e}"))?;
+/// Decode the `data` field from a SQL API v2 jsonv2 response into row-major strings.
+fn decode_jsonv2_rows(resp: &Value) -> Result<Vec<Vec<Option<String>>>> {
+    let data = match resp.get("data").and_then(|d| d.as_array()) {
+        Some(arr) => arr,
+        None => return Ok(vec![]),
+    };
 
-    let cursor = std::io::Cursor::new(bytes);
-    let reader =
-        StreamReader::try_new(cursor, None).map_err(|e| anyhow!("Arrow IPC read failed: {e}"))?;
+    let rows = data
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .ok_or_else(|| anyhow!("SQL API v2 row is not an array"))?
+                .iter()
+                .map(|cell| {
+                    Ok(match cell {
+                        Value::Null => None,
+                        Value::String(s) => Some(s.clone()),
+                        other => Some(other.to_string()),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    let mut all_rows: Vec<Vec<Option<String>>> = vec![];
-
-    for batch_result in reader {
-        let batch = batch_result.map_err(|e| anyhow!("Arrow batch read failed: {e}"))?;
-        let num_rows = batch.num_rows();
-        let num_cols = batch.num_columns();
-
-        for row_idx in 0..num_rows {
-            let mut row = Vec::with_capacity(num_cols);
-            for col_idx in 0..num_cols {
-                let col = batch.column(col_idx);
-                let cell = if col.is_null(row_idx) {
-                    None
-                } else {
-                    Some(array_value_to_string(col.as_ref(), row_idx))
-                };
-                row.push(cell);
-            }
-            all_rows.push(row);
-        }
-    }
-
-    Ok(all_rows)
-}
-
-/// Convert a single Arrow array cell to a display string.
-fn array_value_to_string(array: &dyn arrow::array::Array, row: usize) -> String {
-    use arrow::array::*;
-
-    macro_rules! downcast_to_string {
-        ($array:expr, $row:expr, $($t:ty => $arr:ty),+) => {
-            $(
-                if let Some(a) = $array.as_any().downcast_ref::<$arr>() {
-                    return a.value($row).to_string();
-                }
-            )+
-        };
-    }
-
-    downcast_to_string!(array, row,
-        i8   => Int8Array,
-        i16  => Int16Array,
-        i32  => Int32Array,
-        i64  => Int64Array,
-        u8   => UInt8Array,
-        u16  => UInt16Array,
-        u32  => UInt32Array,
-        u64  => UInt64Array,
-        f32  => Float32Array,
-        f64  => Float64Array,
-        bool => BooleanArray
-    );
-
-    if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
-        return a.value(row).to_string();
-    }
-    if let Some(a) = array.as_any().downcast_ref::<BinaryArray>() {
-        return format!("{:?}", a.value(row));
-    }
-
-    // Fallback: use the arrow display utility
-    arrow::util::display::array_value_to_string(array, row).unwrap_or_else(|_| "<?>".to_string())
+    Ok(rows)
 }

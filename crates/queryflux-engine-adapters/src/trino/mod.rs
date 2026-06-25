@@ -17,7 +17,7 @@ use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{
         BackendQueryId, ClusterGroupName, ClusterName, EngineType, QueryEngineStats,
-        QueryExecution, QueryPollResult,
+        QueryExecution, QueryPollResult, QueryStatus,
     },
     session::SessionContext,
     tags::QueryTags,
@@ -90,9 +90,9 @@ impl crate::EngineConfigParseable for TrinoConfig {
 
 /// Trino HTTP adapter.
 ///
-/// For Trino→Trino transparent forwarding, `submit_query` and `poll_query` return
-/// `QueryExecution::Async { initial_body: Some(...) }` and `QueryPollResult::Raw { ... }`
-/// respectively. The Trino HTTP frontend rewrites nextUri and returns raw bytes directly.
+/// For Trino→Trino transparent forwarding, `submit_query` returns `QueryExecution::Running`
+/// or `QueryExecution::Completed` and `poll_query` returns `QueryPollResult::Raw`.
+/// The Trino HTTP frontend rewrites the embedded poll URL and returns raw bytes directly.
 #[derive(Clone)]
 pub struct TrinoAdapter {
     pub cluster_name: ClusterName,
@@ -247,6 +247,20 @@ impl TrinoAdapter {
             }
         }
     }
+
+    fn extract_engine_stats(&self, resp: &TrinoResponse) -> QueryEngineStats {
+        let s = &resp.stats;
+        QueryEngineStats {
+            engine_elapsed_time_ms: Some(s.elapsed_time_millis),
+            cpu_time_ms: Some(s.cpu_time_millis),
+            processed_rows: Some(s.processed_rows),
+            processed_bytes: Some(s.processed_bytes),
+            physical_input_bytes: Some(s.physical_input_bytes),
+            peak_memory_bytes: Some(s.peak_memory_bytes),
+            spilled_bytes: Some(s.spilled_bytes),
+            total_splits: Some(s.total_splits),
+        }
+    }
 }
 
 #[async_trait]
@@ -299,25 +313,43 @@ impl AsyncAdapter for TrinoAdapter {
             .map_err(|e| QueryFluxError::Engine(format!("Failed to parse Trino response: {e}")))?;
 
         let backend_query_id = BackendQueryId(trino_resp.id.clone());
-        let next_uri = trino_resp.next_uri.clone();
 
-        Ok(QueryExecution::Async {
-            backend_query_id,
-            next_uri,
-            initial_body: Some(body_bytes),
-        })
+        if let Some(poll_token) = trino_resp.next_uri.clone() {
+            Ok(QueryExecution::Running {
+                backend_query_id,
+                poll_token: Some(poll_token),
+                initial_response: Some(body_bytes),
+            })
+        } else {
+            // Query completed (or failed) on the initial POST — no polling needed.
+            let engine_stats = Some(self.extract_engine_stats(&trino_resp));
+            let (status, error) = if let Some(err) = &trino_resp.error {
+                (QueryStatus::Failed, Some(err.message.clone()))
+            } else if trino_resp.stats.state == "FAILED" {
+                (QueryStatus::Failed, Some("Trino query FAILED".to_string()))
+            } else {
+                (QueryStatus::Success, None)
+            };
+            Ok(QueryExecution::Completed {
+                backend_query_id,
+                status,
+                error,
+                engine_stats,
+                initial_response: Some(body_bytes),
+            })
+        }
     }
 
     async fn poll_query(
         &self,
         _backend_id: &BackendQueryId,
-        next_uri: Option<&str>,
+        poll_token: Option<&str>,
     ) -> Result<QueryPollResult> {
-        let uri = match next_uri {
+        let uri = match poll_token {
             Some(u) => u,
             None => {
                 return Ok(QueryPollResult::Failed {
-                    message: "poll_query called with no nextUri".to_string(),
+                    message: "poll_query called with no poll token".to_string(),
                     error_code: None,
                 })
             }
@@ -361,29 +393,19 @@ impl AsyncAdapter for TrinoAdapter {
         // proxy must treat that as terminal too — otherwise we never run `record_query` on the last
         // GET the client actually performs.
         let state = trino_resp.stats.state.as_str();
-        let mut next_uri = trino_resp.next_uri.clone();
-        if next_uri.is_some() && state.eq_ignore_ascii_case("FINISHED") {
-            next_uri = None;
+        let mut poll_token = trino_resp.next_uri.clone();
+        if poll_token.is_some() && state.eq_ignore_ascii_case("FINISHED") {
+            poll_token = None;
         }
 
-        let engine_stats = if next_uri.is_none() {
-            let s = &trino_resp.stats;
-            Some(QueryEngineStats {
-                engine_elapsed_time_ms: Some(s.elapsed_time_millis),
-                cpu_time_ms: Some(s.cpu_time_millis),
-                processed_rows: Some(s.processed_rows),
-                processed_bytes: Some(s.processed_bytes),
-                physical_input_bytes: Some(s.physical_input_bytes),
-                peak_memory_bytes: Some(s.peak_memory_bytes),
-                spilled_bytes: Some(s.spilled_bytes),
-                total_splits: Some(s.total_splits),
-            })
+        let engine_stats = if poll_token.is_none() {
+            Some(self.extract_engine_stats(&trino_resp))
         } else {
             None
         };
         Ok(QueryPollResult::Raw {
             body: body_bytes,
-            next_uri,
+            poll_token,
             engine_stats,
         })
     }
@@ -392,21 +414,6 @@ impl AsyncAdapter for TrinoAdapter {
         // Trino cancel: DELETE the nextUri. We'd need to look it up from persistence.
         // For now this is handled by the frontend which has the stored next_uri.
         Ok(())
-    }
-
-    fn terminal_stats_from_body(&self, body: &bytes::Bytes) -> Option<QueryEngineStats> {
-        let trino_resp: TrinoResponse = serde_json::from_slice(body.as_ref()).ok()?;
-        let s = &trino_resp.stats;
-        Some(QueryEngineStats {
-            engine_elapsed_time_ms: Some(s.elapsed_time_millis),
-            cpu_time_ms: Some(s.cpu_time_millis),
-            processed_rows: Some(s.processed_rows),
-            processed_bytes: Some(s.processed_bytes),
-            physical_input_bytes: Some(s.physical_input_bytes),
-            peak_memory_bytes: Some(s.peak_memory_bytes),
-            spilled_bytes: Some(s.spilled_bytes),
-            total_splits: Some(s.total_splits),
-        })
     }
 
     async fn execute_as_arrow(
@@ -424,11 +431,20 @@ impl AsyncAdapter for TrinoAdapter {
         let execution = self
             .submit_query(sql, session, credentials, tags, params)
             .await?;
-        let queryflux_core::query::QueryExecution::Async {
-            backend_query_id,
-            mut next_uri,
-            initial_body,
-        } = execution;
+        let (backend_query_id, mut poll_token, initial_response, initial_engine_stats) =
+            match execution {
+                queryflux_core::query::QueryExecution::Running {
+                    backend_query_id,
+                    poll_token,
+                    initial_response,
+                } => (backend_query_id, poll_token, initial_response, None),
+                queryflux_core::query::QueryExecution::Completed {
+                    backend_query_id,
+                    engine_stats,
+                    initial_response,
+                    ..
+                } => (backend_query_id, None, initial_response, engine_stats),
+            };
 
         let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<crate::Result<RecordBatch>>(32);
         let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();
@@ -437,70 +453,66 @@ impl AsyncAdapter for TrinoAdapter {
 
         tokio::spawn(async move {
             let mut schema: Option<std::sync::Arc<arrow::datatypes::Schema>> = None;
-            let mut last_engine_stats: Option<QueryEngineStats> = None;
+            let mut last_engine_stats: Option<QueryEngineStats> = initial_engine_stats;
             let mut sent_any = false;
 
             // Process the initial response body — may contain the first page of data.
-            if let Some(ref body) = initial_body {
+            if let Some(ref body) = initial_response {
                 match trino_body_to_batch(body, &mut schema) {
                     Ok(Some(batch)) => {
                         sent_any = true;
                         if batch_tx.send(Ok(batch)).await.is_err() {
-                            adapter.cancel_at_next_uri(next_uri.as_deref()).await;
+                            adapter.cancel_at_next_uri(poll_token.as_deref()).await;
                             return;
                         }
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        adapter.cancel_at_next_uri(next_uri.as_deref()).await;
+                        adapter.cancel_at_next_uri(poll_token.as_deref()).await;
                         let _ = batch_tx.send(Err(e)).await;
                         return;
                     }
                 }
-                // Fast queries finish on the POST with no nextUri — stats only appear here, not in the poll loop.
-                if next_uri.is_none() {
-                    last_engine_stats = adapter.terminal_stats_from_body(body);
-                }
             }
 
-            // Poll until the query is complete (next_uri becomes None).
-            while next_uri.is_some() {
+            // Poll until the query is complete (poll_token becomes None).
+            while poll_token.is_some() {
                 let result = adapter
-                    .poll_query(&backend_query_id, next_uri.as_deref())
+                    .poll_query(&backend_query_id, poll_token.as_deref())
                     .await;
                 match result {
                     Err(e) => {
-                        adapter.cancel_at_next_uri(next_uri.as_deref()).await;
+                        adapter.cancel_at_next_uri(poll_token.as_deref()).await;
                         let _ = batch_tx.send(Err(e)).await;
                         return;
                     }
                     Ok(QueryPollResult::Raw {
                         body,
-                        next_uri: next,
+                        poll_token: next,
                         engine_stats,
                     }) => {
                         if next.is_none() {
                             last_engine_stats = engine_stats;
                         }
-                        next_uri = next;
+                        poll_token = next;
                         match trino_body_to_batch(&body, &mut schema) {
                             Ok(Some(batch)) => {
                                 sent_any = true;
                                 if batch_tx.send(Ok(batch)).await.is_err() {
-                                    adapter.cancel_at_next_uri(next_uri.as_deref()).await;
+                                    adapter.cancel_at_next_uri(poll_token.as_deref()).await;
                                     return;
                                 }
                             }
                             Ok(None) => {}
                             Err(e) => {
-                                adapter.cancel_at_next_uri(next_uri.as_deref()).await;
+                                adapter.cancel_at_next_uri(poll_token.as_deref()).await;
                                 let _ = batch_tx.send(Err(e)).await;
                                 return;
                             }
                         }
                     }
                     Ok(QueryPollResult::Failed { message, .. }) => {
-                        adapter.cancel_at_next_uri(next_uri.as_deref()).await;
+                        adapter.cancel_at_next_uri(poll_token.as_deref()).await;
                         let _ = batch_tx.send(Err(QueryFluxError::Engine(message))).await;
                         return;
                     }
@@ -591,11 +603,25 @@ impl AsyncAdapter for TrinoAdapter {
                 &vec![],
             )
             .await?;
-        if let QueryExecution::Async {
-            initial_body: Some(body),
-            ..
-        } = execution
-        {
+        let initial_response = match execution {
+            QueryExecution::Running {
+                initial_response, ..
+            } => initial_response,
+            QueryExecution::Completed {
+                status,
+                error,
+                initial_response,
+                ..
+            } => {
+                if status != QueryStatus::Success {
+                    return Err(QueryFluxError::Catalog(
+                        error.unwrap_or_else(|| "Trino DESCRIBE query failed".to_string()),
+                    ));
+                }
+                initial_response
+            }
+        };
+        if let Some(body) = initial_response {
             let resp: TrinoResponse = serde_json::from_slice(&body)
                 .map_err(|e| QueryFluxError::Catalog(format!("DESCRIBE parse failed: {e}")))?;
             let columns = parse_describe_result(&resp, catalog, database, table);
@@ -626,18 +652,25 @@ impl TrinoAdapter {
             )
             .await
             .ok()?;
-        let QueryExecution::Async {
-            backend_query_id,
-            mut next_uri,
-            initial_body,
-        } = execution;
-        let mut body = initial_body?;
+        let (backend_query_id, mut poll_token, initial_response) = match execution {
+            QueryExecution::Running {
+                backend_query_id,
+                poll_token,
+                initial_response,
+            } => (backend_query_id, poll_token, initial_response),
+            QueryExecution::Completed {
+                backend_query_id,
+                initial_response,
+                ..
+            } => (backend_query_id, None, initial_response),
+        };
+        let mut body = initial_response?;
 
         if let Some(n) = trino_json_first_cell_u64_from_body(&body) {
             return Some(n);
         }
 
-        while let Some(ref uri) = next_uri {
+        while let Some(ref uri) = poll_token {
             let result = self
                 .poll_query(&backend_query_id, Some(uri.as_str()))
                 .await
@@ -645,7 +678,7 @@ impl TrinoAdapter {
             match result {
                 QueryPollResult::Raw {
                     body: b,
-                    next_uri: n,
+                    poll_token: n,
                     ..
                 } => {
                     if let Some(v) = trino_json_first_cell_u64_from_body(&b) {
@@ -653,7 +686,7 @@ impl TrinoAdapter {
                     }
                     n.as_ref()?;
                     body = b;
-                    next_uri = n;
+                    poll_token = n;
                 }
                 QueryPollResult::Failed { .. } | QueryPollResult::Pending { .. } => return None,
             }
@@ -680,11 +713,25 @@ impl TrinoAdapter {
                 &vec![],
             )
             .await?;
-        if let QueryExecution::Async {
-            initial_body: Some(body),
-            ..
-        } = execution
-        {
+        let initial_response = match execution {
+            QueryExecution::Running {
+                initial_response, ..
+            } => initial_response,
+            QueryExecution::Completed {
+                status,
+                error,
+                initial_response,
+                ..
+            } => {
+                if status != QueryStatus::Success {
+                    return Err(QueryFluxError::Catalog(
+                        error.unwrap_or_else(|| format!("Trino SHOW query failed: {sql}")),
+                    ));
+                }
+                initial_response
+            }
+        };
+        if let Some(body) = initial_response {
             let resp: TrinoResponse = serde_json::from_slice(&body)
                 .map_err(|e| QueryFluxError::Catalog(format!("SHOW query parse failed: {e}")))?;
             if let Some(data) = resp.data {

@@ -15,6 +15,8 @@ pub const PROTO_CAMEL_SNAKE: &[(&str, &str)] = &[
     ("mysqlWire", "mysql_wire"),
     ("clickhouseHttp", "clickhouse_http"),
     ("flightSql", "flight_sql"),
+    ("snowflakeHttp", "snowflake_http"),
+    ("snowflakeSqlApi", "snowflake_sql_api"),
 ];
 
 pub fn field<'a>(v: &'a Value, camel: &str, snake: &str) -> Option<&'a Value> {

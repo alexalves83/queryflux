@@ -1,7 +1,8 @@
 //! End-to-end tests for QueryParams native parameter binding.
 //!
-//! These tests use the Snowflake HTTP frontend (which accepts `parameterBindings`)
-//! targeting an in-process DuckDB backend (always available — no external dependency).
+//! These tests use the Snowflake SQL API v2 frontend (`/api/v2/statements`, which
+//! accepts a `bindings` map) targeting an in-process DuckDB backend (always available —
+//! no external dependency).
 //!
 //! Run with: `cargo test -p queryflux-e2e-tests --test query_params_tests`
 
@@ -36,17 +37,15 @@ fn sf_client() -> SnowflakeClient {
     SnowflakeClient::new(&harness().base_url())
 }
 
-/// Helper: login + run a parameterized query, panic on any protocol error.
+/// Helper: run a parameterized query via the SQL API v2, panic on any protocol error.
 async fn run(
     sql: &str,
     bindings: Option<serde_json::Value>,
 ) -> queryflux_e2e_tests::snowflake_client::SfQueryResult {
-    let client = sf_client();
-    let token = client.login().await.expect("Snowflake login");
-    client
-        .query(&token, sql, bindings)
+    sf_client()
+        .query(sql, bindings)
         .await
-        .expect("Snowflake query")
+        .expect("Snowflake SQL API v2 query")
 }
 
 // ---------------------------------------------------------------------------
@@ -59,12 +58,6 @@ async fn duckdb_group_is_always_available() {
         harness().has_group(GROUP_DUCKDB),
         "DuckDB group should always be available"
     );
-}
-
-#[tokio::test]
-async fn snowflake_login_succeeds() {
-    let token = sf_client().login().await.expect("login");
-    assert!(!token.is_empty());
 }
 
 #[tokio::test]

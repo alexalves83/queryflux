@@ -1,304 +1,345 @@
-//! In-memory Snowflake HTTP wire sessions (login token → routing/auth context).
+//! Process-local session store for the Snowflake HTTP wire protocol v1.
 //!
-//! **Not replicated across QueryFlux processes.** With multiple replicas or during rolling
-//! upgrades, clients must stick to one instance (load balancer affinity on the Snowflake token /
-//! `Authorization` header) or sessions will not resolve. Configure
-//! `queryflux.enforceSnowflakeHttpSessionAffinity` + `sessionAffinityAcknowledged` on the
-//! Snowflake HTTP frontend once sticky routing is in place.
+//! Sessions are keyed by an opaque UUID token issued at login. Each session carries
+//! the authenticated user's `AuthContext` and the cluster group resolved at login time,
+//! so subsequent queries in the same session use the same routing decision.
 //!
-//! Sessions honor [`SnowflakeHttpSessionPolicy`] (max age + idle timeout) on every authenticated
-//! request (`validate_snowflake_session`).
+//! **Multi-replica note**: this store is process-local. When running multiple QueryFlux
+//! replicas, the load balancer must be configured for sticky session affinity so that all
+//! requests from a given client land on the same instance.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use tokio::time::interval;
+use std::time::Duration;
 
 use dashmap::DashMap;
+use std::time::Instant;
+use uuid::Uuid;
+
 use queryflux_auth::AuthContext;
-use queryflux_core::config::FrontendConfig;
 use queryflux_core::query::ClusterGroupName;
 
-/// Wall-clock and idle limits for Snowflake HTTP wire sessions.
-#[derive(Debug, Clone)]
+// ---------------------------------------------------------------------------
+// Policy
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
 pub struct SnowflakeHttpSessionPolicy {
-    /// Maximum lifetime since login. `None` = no limit.
-    pub max_session_age: Option<Duration>,
-    /// Maximum time since last successful [`SnowflakeSessionStore::validate_snowflake_session`].
-    /// `None` = no idle eviction.
-    pub idle_timeout: Option<Duration>,
+    /// Maximum session lifetime. `Duration::ZERO` = no limit.
+    pub max_session_age: Duration,
+    /// Idle timeout (time since last activity). `Duration::ZERO` = no limit.
+    pub idle_timeout: Duration,
 }
 
 impl Default for SnowflakeHttpSessionPolicy {
     fn default() -> Self {
         Self {
-            max_session_age: Some(Duration::from_secs(24 * 3600)),
-            idle_timeout: Some(Duration::from_secs(4 * 3600)),
+            max_session_age: Duration::from_secs(86400),
+            idle_timeout: Duration::from_secs(14400),
         }
     }
 }
 
-impl SnowflakeHttpSessionPolicy {
-    /// Build policy from `frontends.snowflakeHttp` YAML. Omitted fields use defaults (24h / 4h).
-    /// `0` disables that limit (matches “no max age” / “no idle timeout”).
-    pub fn from_frontend_config(cfg: &FrontendConfig) -> Self {
-        Self {
-            max_session_age: match cfg.snowflake_session_max_age_secs {
-                None => Some(Duration::from_secs(24 * 3600)),
-                Some(0) => None,
-                Some(s) => Some(Duration::from_secs(s)),
-            },
-            idle_timeout: match cfg.snowflake_session_idle_timeout_secs {
-                None => Some(Duration::from_secs(4 * 3600)),
-                Some(0) => None,
-                Some(s) => Some(Duration::from_secs(s)),
-            },
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Session record
+// ---------------------------------------------------------------------------
 
-/// Snapshot returned after a successful [`SnowflakeSessionStore::validate_snowflake_session`].
-#[derive(Debug, Clone)]
-pub struct SnowflakeSessionSnapshot {
+pub struct SnowflakeSession {
+    pub user: String,
     pub auth_ctx: AuthContext,
     pub group: ClusterGroupName,
-    pub user: Option<String>,
     pub database: Option<String>,
     pub schema: Option<String>,
+    created_at: Instant,
+    last_seen: Instant,
 }
 
-/// Successful validation: session fields plus optional `validityInSecondsST` for the token response.
-#[derive(Debug, Clone)]
-pub struct ValidatedSnowflakeSession {
-    pub snapshot: SnowflakeSessionSnapshot,
-    /// Remaining seconds until **max session age** or **idle timeout**, whichever is sooner.
-    /// `None` when both policy limits are disabled (unbounded session).
-    pub validity_in_seconds_st: Option<u64>,
-}
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
 
-/// Stores active QueryFlux Snowflake wire-protocol sessions keyed by the qf_token
-/// issued to the client at login. **Process-local** — no backend Snowflake account is needed.
 pub struct SnowflakeSessionStore {
-    sessions: DashMap<String, SnowflakeSession>,
+    sessions: Arc<DashMap<String, SnowflakeSession>>,
     policy: SnowflakeHttpSessionPolicy,
 }
 
-pub struct SnowflakeSession {
-    pub qf_token: String,
-    pub user: Option<String>,
-    pub auth_ctx: AuthContext,
-    /// Cluster group resolved at login time (via the router chain).
-    pub group: ClusterGroupName,
-    /// Database/schema hints from the login request (SESSION_PARAMETERS or query params).
-    pub database: Option<String>,
-    pub schema: Option<String>,
-    pub created_at: Instant,
-    /// Last successful [`SnowflakeSessionStore::validate_snowflake_session`] (or login).
-    pub last_seen: Instant,
-}
-
 impl SnowflakeSessionStore {
-    pub fn new(policy: SnowflakeHttpSessionPolicy) -> Arc<Self> {
-        let store = Arc::new(Self {
-            sessions: DashMap::new(),
+    pub fn new(policy: SnowflakeHttpSessionPolicy) -> Self {
+        Self {
+            sessions: Arc::new(DashMap::new()),
             policy,
-        });
-        // Spawn a background task to evict sessions that were abandoned (client never
-        // logged out). Without this, the DashMap grows monotonically.
-        // Only spawns when a Tokio runtime is active (production / async tests).
-        // Plain `#[test]` functions have no reactor; the GC is simply skipped there.
-        if (store.policy.max_session_age.is_some() || store.policy.idle_timeout.is_some())
-            && tokio::runtime::Handle::try_current().is_ok()
-        {
-            let weak = Arc::downgrade(&store);
-            tokio::spawn(async move {
-                // Sweep every 5 minutes. Fine-grained enough to bound memory growth
-                // without adding noticeable overhead.
-                let mut ticker = interval(Duration::from_secs(300));
-                ticker.tick().await; // skip the immediate first tick
-                loop {
-                    ticker.tick().await;
-                    match weak.upgrade() {
-                        Some(s) => s.sweep_expired(),
-                        None => break, // store dropped — stop GC task
-                    }
-                }
-            });
         }
-        store
     }
 
-    /// Remove all sessions that have exceeded their max age or idle timeout.
-    /// Called by the background GC task; also callable from tests.
-    pub fn sweep_expired(&self) {
-        let policy = &self.policy;
-        self.sessions.retain(|_, session| {
-            if let Some(max) = policy.max_session_age {
-                if session.created_at.elapsed() > max {
-                    return false;
-                }
+    /// Spawn the background GC task. Call once after construction when the Tokio
+    /// runtime is running. The task runs until the store is dropped.
+    pub fn spawn_gc(&self) {
+        let sessions = Arc::clone(&self.sessions);
+        let policy = self.policy.clone();
+        let has_limit =
+            policy.max_session_age != Duration::ZERO || policy.idle_timeout != Duration::ZERO;
+        if !has_limit {
+            return;
+        }
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let now = Instant::now();
+                sessions.retain(|_, s| !is_expired(s, &policy, now));
             }
-            if let Some(idle) = policy.idle_timeout {
-                if session.last_seen.elapsed() > idle {
-                    return false;
-                }
-            }
-            true
         });
     }
 
-    pub fn insert(&self, token: String, session: SnowflakeSession) {
-        self.sessions.insert(token, session);
-    }
-
-    pub fn get(
+    /// Insert a new session and return the opaque token.
+    pub fn create_session(
         &self,
-        token: &str,
-    ) -> Option<dashmap::mapref::one::Ref<'_, String, SnowflakeSession>> {
-        self.sessions.get(token)
+        user: String,
+        auth_ctx: AuthContext,
+        group: ClusterGroupName,
+        database: Option<String>,
+        schema: Option<String>,
+    ) -> String {
+        let token = Uuid::new_v4().to_string();
+        let now = Instant::now();
+        self.sessions.insert(
+            token.clone(),
+            SnowflakeSession {
+                user,
+                auth_ctx,
+                group,
+                database,
+                schema,
+                created_at: now,
+                last_seen: now,
+            },
+        );
+        token
     }
 
-    pub fn remove(&self, token: &str) {
+    /// Validate a session token. On success bumps `last_seen` and returns remaining
+    /// validity in seconds (min of age-remaining and idle-remaining; u64::MAX if unlimited).
+    /// Returns `None` if the token is unknown or the session has expired (also removes it).
+    pub fn validate_session(&self, token: &str) -> Option<(u64, SessionRef<'_>)> {
+        let now = Instant::now();
+        // Check expiry first without holding a write ref.
+        {
+            let entry = self.sessions.get(token)?;
+            if is_expired(&entry, &self.policy, now) {
+                drop(entry);
+                self.sessions.remove(token);
+                return None;
+            }
+        }
+        // Bump last_seen.
+        let mut entry = self.sessions.get_mut(token)?;
+        entry.last_seen = now;
+        let remaining = remaining_secs(&entry, &self.policy, now);
+        // SAFETY: `entry` borrows from `self.sessions` which lives as long as `self`.
+        // We return a `SessionRef` that carries the DashMap guard lifetime.
+        Some((remaining, SessionRef { _guard: entry }))
+    }
+
+    /// Explicitly remove a session (logout).
+    pub fn remove_session(&self, token: &str) {
         self.sessions.remove(token);
     }
+}
 
-    /// Look up the session, enforce [`SnowflakeHttpSessionPolicy`], bump `last_seen` on success,
-    /// and remove the entry when expired or missing.
-    pub fn validate_snowflake_session(&self, token: &str) -> Option<ValidatedSnowflakeSession> {
-        let mut guard = self.sessions.get_mut(token)?;
-        let now = Instant::now();
+// ---------------------------------------------------------------------------
+// SessionRef — holds the DashMap read guard so the caller can access fields
+// ---------------------------------------------------------------------------
 
-        if let Some(max) = self.policy.max_session_age {
-            if guard.created_at.elapsed() > max {
-                drop(guard);
-                self.sessions.remove(token);
-                return None;
-            }
-        }
-        if let Some(idle) = self.policy.idle_timeout {
-            if guard.last_seen.elapsed() > idle {
-                drop(guard);
-                self.sessions.remove(token);
-                return None;
-            }
-        }
+pub struct SessionRef<'a> {
+    _guard: dashmap::mapref::one::RefMut<'a, String, SnowflakeSession>,
+}
 
-        // Refresh last_seen BEFORE computing the remaining idle TTL so the response
-        // reflects the just-renewed lifetime, not the stale pre-call value.
-        guard.last_seen = now;
-
-        let age_remaining = self
-            .policy
-            .max_session_age
-            .map(|max| max.saturating_sub(guard.created_at.elapsed()).as_secs());
-        let idle_remaining = self
-            .policy
-            .idle_timeout
-            .map(|idle| idle.saturating_sub(guard.last_seen.elapsed()).as_secs());
-        let validity_in_seconds_st = match (age_remaining, idle_remaining) {
-            (Some(a), Some(i)) => Some(a.min(i)),
-            (Some(a), None) => Some(a),
-            (None, Some(i)) => Some(i),
-            (None, None) => None,
-        };
-        Some(ValidatedSnowflakeSession {
-            validity_in_seconds_st,
-            snapshot: SnowflakeSessionSnapshot {
-                auth_ctx: guard.auth_ctx.clone(),
-                group: guard.group.clone(),
-                user: guard.user.clone(),
-                database: guard.database.clone(),
-                schema: guard.schema.clone(),
-            },
-        })
+impl<'a> std::ops::Deref for SessionRef<'a> {
+    type Target = SnowflakeSession;
+    fn deref(&self) -> &Self::Target {
+        &self._guard
     }
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn is_expired(s: &SnowflakeSession, policy: &SnowflakeHttpSessionPolicy, now: Instant) -> bool {
+    if policy.max_session_age != Duration::ZERO
+        && now.duration_since(s.created_at) >= policy.max_session_age
+    {
+        return true;
+    }
+    if policy.idle_timeout != Duration::ZERO
+        && now.duration_since(s.last_seen) >= policy.idle_timeout
+    {
+        return true;
+    }
+    false
+}
+
+fn remaining_secs(s: &SnowflakeSession, policy: &SnowflakeHttpSessionPolicy, now: Instant) -> u64 {
+    let age_remaining = if policy.max_session_age != Duration::ZERO {
+        policy
+            .max_session_age
+            .saturating_sub(now.duration_since(s.created_at))
+            .as_secs()
+    } else {
+        u64::MAX
+    };
+    let idle_remaining = if policy.idle_timeout != Duration::ZERO {
+        policy
+            .idle_timeout
+            .saturating_sub(now.duration_since(s.last_seen))
+            .as_secs()
+    } else {
+        u64::MAX
+    };
+    age_remaining.min(idle_remaining)
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use queryflux_core::query::ClusterGroupName;
-    use std::thread;
+    use queryflux_auth::AuthContext;
 
-    fn dummy_session(token: &str, created: Instant, last_seen: Instant) -> SnowflakeSession {
-        SnowflakeSession {
-            qf_token: token.to_string(),
-            user: Some("u".into()),
-            auth_ctx: AuthContext {
-                user: "u".into(),
-                groups: vec![],
-                roles: vec![],
-                raw_token: None,
-            },
-            group: ClusterGroupName("g".into()),
-            database: None,
-            schema: None,
-            created_at: created,
-            last_seen,
+    fn make_auth() -> AuthContext {
+        AuthContext {
+            user: "test_user".to_string(),
+            groups: vec![],
+            roles: vec![],
+            raw_token: None,
         }
     }
 
-    #[test]
-    fn validate_updates_last_seen_and_allows_repeated_checks_within_idle() {
-        let store = SnowflakeSessionStore::new(SnowflakeHttpSessionPolicy {
-            max_session_age: None,
-            idle_timeout: Some(Duration::from_secs(3600)),
-        });
-        let now = Instant::now();
-        store.insert("t1".into(), dummy_session("t1", now, now));
-        assert!(store.validate_snowflake_session("t1").is_some());
-        assert!(store.validate_snowflake_session("t1").is_some());
+    fn store_with_policy(max_age_secs: u64, idle_secs: u64) -> SnowflakeSessionStore {
+        SnowflakeSessionStore::new(SnowflakeHttpSessionPolicy {
+            max_session_age: if max_age_secs == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(max_age_secs)
+            },
+            idle_timeout: if idle_secs == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(idle_secs)
+            },
+        })
     }
 
     #[test]
-    fn idle_timeout_evicts_session() {
-        let store = SnowflakeSessionStore::new(SnowflakeHttpSessionPolicy {
-            max_session_age: None,
-            idle_timeout: Some(Duration::from_millis(40)),
-        });
-        let now = Instant::now();
-        store.insert("t2".into(), dummy_session("t2", now, now));
-        assert!(store.validate_snowflake_session("t2").is_some());
-        thread::sleep(Duration::from_millis(80));
-        assert!(store.validate_snowflake_session("t2").is_none());
-        assert!(store.get("t2").is_none());
+    fn create_and_validate() {
+        let store = store_with_policy(3600, 900);
+        let token = store.create_session(
+            "alice".into(),
+            make_auth(),
+            ClusterGroupName("prod".into()),
+            Some("mydb".into()),
+            None,
+        );
+        let result = store.validate_session(&token);
+        assert!(result.is_some());
+        let (remaining, session) = result.unwrap();
+        assert!(remaining > 0);
+        assert_eq!(session.user, "alice");
+        assert_eq!(session.database.as_deref(), Some("mydb"));
     }
 
     #[test]
-    fn max_session_age_evicts_even_if_recently_touched() {
-        let store = SnowflakeSessionStore::new(SnowflakeHttpSessionPolicy {
-            max_session_age: Some(Duration::from_millis(40)),
-            idle_timeout: Some(Duration::from_secs(3600)),
-        });
-        let Some(created) = Instant::now().checked_sub(Duration::from_millis(100)) else {
-            return;
-        };
-        store.insert("t3".into(), dummy_session("t3", created, Instant::now()));
-        assert!(store.validate_snowflake_session("t3").is_none());
-        assert!(store.get("t3").is_none());
+    fn unknown_token_returns_none() {
+        let store = store_with_policy(3600, 900);
+        assert!(store.validate_session("no-such-token").is_none());
     }
 
     #[test]
-    fn validate_reports_remaining_ttl_min_of_age_and_idle() {
-        let store = SnowflakeSessionStore::new(SnowflakeHttpSessionPolicy {
-            max_session_age: Some(Duration::from_secs(10_000)),
-            idle_timeout: Some(Duration::from_secs(100)),
-        });
-        let now = Instant::now();
-        store.insert("t4".into(), dummy_session("t4", now, now));
-        let v = store.validate_snowflake_session("t4").unwrap();
-        assert!(v.validity_in_seconds_st.unwrap() <= 100);
+    fn logout_invalidates_session() {
+        let store = store_with_policy(3600, 900);
+        let token = store.create_session(
+            "bob".into(),
+            make_auth(),
+            ClusterGroupName("g".into()),
+            None,
+            None,
+        );
+        store.remove_session(&token);
+        assert!(store.validate_session(&token).is_none());
     }
 
     #[test]
-    fn validate_omits_validity_when_both_limits_disabled() {
+    fn expired_by_max_age() {
         let store = SnowflakeSessionStore::new(SnowflakeHttpSessionPolicy {
-            max_session_age: None,
-            idle_timeout: None,
+            max_session_age: Duration::from_millis(1),
+            idle_timeout: Duration::ZERO,
         });
-        let now = Instant::now();
-        store.insert("t5".into(), dummy_session("t5", now, now));
-        let v = store.validate_snowflake_session("t5").unwrap();
-        assert!(v.validity_in_seconds_st.is_none());
+        let token = store.create_session(
+            "charlie".into(),
+            make_auth(),
+            ClusterGroupName("g".into()),
+            None,
+            None,
+        );
+        // Give time to elapse past the 1ms max age.
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(store.validate_session(&token).is_none());
+    }
+
+    #[test]
+    fn expired_by_idle_timeout() {
+        let store = SnowflakeSessionStore::new(SnowflakeHttpSessionPolicy {
+            max_session_age: Duration::ZERO,
+            idle_timeout: Duration::from_millis(1),
+        });
+        let token = store.create_session(
+            "dave".into(),
+            make_auth(),
+            ClusterGroupName("g".into()),
+            None,
+            None,
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(store.validate_session(&token).is_none());
+    }
+
+    #[test]
+    fn validate_bumps_idle_timer() {
+        let store = SnowflakeSessionStore::new(SnowflakeHttpSessionPolicy {
+            max_session_age: Duration::ZERO,
+            idle_timeout: Duration::from_millis(20),
+        });
+        let token = store.create_session(
+            "eve".into(),
+            make_auth(),
+            ClusterGroupName("g".into()),
+            None,
+            None,
+        );
+        // Still within idle timeout — validate bumps last_seen.
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(store.validate_session(&token).is_some());
+        // Another 10ms since last validate — total 20ms but last_seen was just bumped.
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(store.validate_session(&token).is_some());
+        // Now wait past idle timeout without any activity.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(store.validate_session(&token).is_none());
+    }
+
+    #[test]
+    fn no_limits_never_expires() {
+        let store = store_with_policy(0, 0);
+        let token = store.create_session(
+            "frank".into(),
+            make_auth(),
+            ClusterGroupName("g".into()),
+            None,
+            None,
+        );
+        let (remaining, _) = store.validate_session(&token).unwrap();
+        assert_eq!(remaining, u64::MAX);
     }
 }

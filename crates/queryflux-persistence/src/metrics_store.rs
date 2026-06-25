@@ -115,4 +115,27 @@ pub trait MetricsStore: Send + Sync {
 
     /// Called synchronously when a cluster slot is released (query finished or failed).
     fn on_query_finished(&self, _group: &str, _cluster: &str) {}
+
+    /// Called when a distributed-coordination operation against the persistence
+    /// backend fails and the replica falls back to local-only behavior (fail-open).
+    /// `operation` is a low-cardinality label such as `capacity_acquire`,
+    /// `capacity_release`, `capacity_heartbeat`, `capacity_expire`, or `queue_claim`.
+    ///
+    /// A sustained non-zero rate means the global `max_running_queries` limit and
+    /// single-owner queue claiming are NOT being enforced — alert on it.
+    fn on_coordination_failure(&self, _operation: &str) {}
+
+    /// Called when a query is admitted in degraded mode — the global capacity
+    /// lease could not be acquired (Postgres unreachable) and the replica fell
+    /// back to local-only limits. The query proceeds, but global `max_running_queries`
+    /// is not enforced for this admit. A sustained rate indicates the coordination
+    /// backend is degraded; pair with `coordination_failures_total` alerts.
+    fn on_capacity_degraded(&self, _cluster_group: &str, _cluster_name: &str) {}
+
+    /// Called when an authentication attempt fails (wrong password, expired token, etc.).
+    /// A sustained spike can indicate a credential-stuffing attack.
+    fn on_auth_failure(&self, _protocol: &str) {}
+
+    /// Called when a queue admission is rejected because `maxQueuedQueries` was reached.
+    fn on_queue_full(&self, _cluster_group: &str) {}
 }

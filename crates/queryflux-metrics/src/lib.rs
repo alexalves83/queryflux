@@ -40,6 +40,30 @@ impl MetricsStore for MultiMetricsStore {
         }
     }
 
+    fn on_coordination_failure(&self, operation: &str) {
+        for s in &self.stores {
+            s.on_coordination_failure(operation);
+        }
+    }
+
+    fn on_capacity_degraded(&self, cluster_group: &str, cluster_name: &str) {
+        for s in &self.stores {
+            s.on_capacity_degraded(cluster_group, cluster_name);
+        }
+    }
+
+    fn on_auth_failure(&self, protocol: &str) {
+        for s in &self.stores {
+            s.on_auth_failure(protocol);
+        }
+    }
+
+    fn on_queue_full(&self, cluster_group: &str) {
+        for s in &self.stores {
+            s.on_queue_full(cluster_group);
+        }
+    }
+
     async fn record_query(&self, record: QueryRecord) -> Result<()> {
         for s in &self.stores {
             if let Err(e) = s.record_query(record.clone()).await {

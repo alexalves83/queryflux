@@ -127,7 +127,10 @@ impl OpenFgaAuthorizationClient {
     pub fn new(config: OpenFgaConfig) -> Self {
         Self {
             config,
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("build OpenFGA http client"),
             token_cache: tokio::sync::Mutex::new(None),
         }
     }

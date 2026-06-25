@@ -284,7 +284,6 @@ impl AthenaAdapter {
                         "Athena query was cancelled".to_string(),
                     ));
                 }
-                // Running / Queued — keep polling.
                 _ => tokio::time::sleep(Duration::from_millis(500)).await,
             }
         }
@@ -370,7 +369,7 @@ impl AsyncAdapter for AthenaAdapter {
     async fn poll_query(
         &self,
         _backend_id: &BackendQueryId,
-        _next_uri: Option<&str>,
+        _poll_token: Option<&str>,
     ) -> Result<QueryPollResult> {
         Err(QueryFluxError::Engine(
             "Athena does not support async polling via this interface".to_string(),

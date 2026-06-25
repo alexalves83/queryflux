@@ -17,10 +17,12 @@ use crate::{
     script_library::{
         is_valid_script_kind, UpsertUserScript, UserScriptRecord, KIND_TRANSLATION_FIXUP,
     },
-    ClusterConfigStore, LoadedRoutingConfig, Persistence, ProxySettingsStore, QueryHistoryStore,
-    RoutingConfigStore, ScriptLibraryStore,
+    BackendCapabilities, CapacityStore, ClusterConfigStore, ConfigRevisionStore,
+    LoadedRoutingConfig, Persistence, ProxySettingsStore, QueryHistoryStore, QueueCoordinator,
+    RoutingConfigStore, ScriptLibraryStore, SweepCoordinator, SweepGuard,
 };
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use queryflux_core::{
     error::{QueryFluxError, Result},
     query::{BackendQueryId, ExecutingQuery, ProxyQueryId, QueuedQuery},
@@ -65,7 +67,42 @@ pub struct PostgresStore {
 impl PostgresStore {
     /// Connect to Postgres and return a ready instance.
     pub async fn connect(database_url: &str) -> Result<Self> {
-        let pool = PgPool::connect(database_url).await.map_err(|e| {
+        Self::connect_with_pool_size(database_url, None).await
+    }
+
+    /// Connect with explicit pool tuning. `None` values keep sqlx defaults.
+    /// The pool serves the dispatch hot path (capacity acquire/release per
+    /// query) plus persistence, admin, LISTEN/NOTIFY, and sweep connections.
+    pub async fn connect_with_pool_size(
+        database_url: &str,
+        max_connections: Option<u32>,
+    ) -> Result<Self> {
+        Self::connect_with_pool_opts(database_url, max_connections, None, None).await
+    }
+
+    pub async fn connect_with_pool_opts(
+        database_url: &str,
+        max_connections: Option<u32>,
+        acquire_timeout_secs: Option<u64>,
+        statement_timeout_secs: Option<u64>,
+    ) -> Result<Self> {
+        let mut opts = sqlx::postgres::PgPoolOptions::new();
+        if let Some(n) = max_connections {
+            opts = opts.max_connections(n);
+        }
+        let timeout = std::time::Duration::from_secs(acquire_timeout_secs.unwrap_or(30));
+        opts = opts.acquire_timeout(timeout);
+
+        let stmt_ms = statement_timeout_secs.unwrap_or(60).saturating_mul(1000);
+        opts = opts.after_connect(move |conn, _meta| {
+            Box::pin(async move {
+                use sqlx::Executor;
+                conn.execute(format!("SET statement_timeout = {stmt_ms}").as_str())
+                    .await?;
+                Ok(())
+            })
+        });
+        let pool = opts.connect(database_url).await.map_err(|e| {
             QueryFluxError::Persistence(format!("Failed to connect to Postgres: {e}"))
         })?;
         Ok(Self { pool })
@@ -78,6 +115,97 @@ impl PostgresStore {
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("Migration failed: {e}")))?;
         Ok(())
+    }
+}
+
+/// The Postgres sweep lock is a session-scoped advisory lock held on a
+/// dedicated pooled connection inside the returned guard, so if the owning
+/// process crashes mid-sweep, Postgres releases the lock when the connection
+/// drops and another replica takes over on its next tick.
+#[async_trait]
+impl SweepCoordinator for PostgresStore {
+    async fn try_sweep_lock(&self, name: &str) -> Result<Option<Box<dyn SweepGuard>>> {
+        let mut conn =
+            self.pool.acquire().await.map_err(|e| {
+                QueryFluxError::Persistence(format!("sweep lock acquire conn: {e}"))
+            })?;
+
+        let got: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext('sweep:' || $1)::bigint)")
+                .bind(name)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| QueryFluxError::Persistence(format!("sweep lock try: {e}")))?;
+
+        Ok(got.then(|| {
+            Box::new(SweepLock {
+                conn: Some(conn),
+                name: name.to_string(),
+            }) as Box<dyn SweepGuard>
+        }))
+    }
+}
+
+impl BackendCapabilities for PostgresStore {
+    fn supports_distributed_coordination(&self) -> bool {
+        true
+    }
+}
+
+/// Guard for a single-owner background sweep (see [`PostgresStore::try_sweep_lock`]).
+///
+/// Releases the advisory lock on [`Self::release`] or on drop. Session advisory
+/// locks are per-connection, so the unlock must run on the same connection the
+/// lock was taken on; if unlocking fails, the connection is closed rather than
+/// returned to the pool, so the lock can never leak onto a recycled connection.
+pub struct SweepLock {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    name: String,
+}
+
+impl SweepLock {
+    async fn unlock(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>, name: &str) {
+        let res = sqlx::query("SELECT pg_advisory_unlock(hashtext('sweep:' || $1)::bigint)")
+            .bind(name)
+            .execute(&mut *conn)
+            .await;
+        if let Err(e) = res {
+            tracing::warn!("Failed to release sweep lock '{name}': {e}; closing connection");
+            use sqlx::Connection;
+            let _ = conn.detach().close().await;
+        }
+    }
+
+    /// Release the lock now (deterministic, preferred at the end of a sweep).
+    pub async fn release(mut self) {
+        if let Some(conn) = self.conn.take() {
+            Self::unlock(conn, &self.name).await;
+        }
+    }
+}
+
+#[async_trait]
+impl SweepGuard for SweepLock {
+    async fn release(self: Box<Self>) {
+        SweepLock::release(*self).await;
+    }
+}
+
+impl Drop for SweepLock {
+    fn drop(&mut self) {
+        // Fallback for early exits (`continue`, `?`): spawn the unlock so the
+        // connection never returns to the pool still holding the session lock.
+        // `tokio::spawn` panics outside a runtime (e.g. process teardown), so
+        // check first; without a runtime, dropping the connection closes it,
+        // which releases the session-scoped lock server-side.
+        if let Some(conn) = self.conn.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let name = std::mem::take(&mut self.name);
+                handle.spawn(async move {
+                    Self::unlock(conn, &name).await;
+                });
+            }
+        }
     }
 }
 
@@ -299,11 +427,8 @@ impl QueryHistoryStore for PostgresStore {
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("get_conversation: {e}")))
     }
-}
 
-impl PostgresStore {
-    /// Delete all `query_records` rows older than `older_than`. Returns the number of rows deleted.
-    pub async fn purge_old_query_records(
+    async fn purge_old_query_records(
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
@@ -313,26 +438,6 @@ impl PostgresStore {
             .await
             .map_err(|e| QueryFluxError::Persistence(format!("purge_old_query_records: {e}")))?;
         Ok(r.rows_affected())
-    }
-
-    /// Ordered translation fixup bodies per cluster group name (for `LiveConfig`).
-    pub async fn load_group_translation_bodies(&self) -> Result<HashMap<String, Vec<String>>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            r#"SELECT g.name, s.body
-               FROM cluster_group_configs g
-               CROSS JOIN LATERAL unnest(g.translation_script_ids) WITH ORDINALITY AS u(sid, ord)
-               JOIN user_scripts s ON s.id = u.sid AND s.kind = 'translation_fixup'
-               ORDER BY g.name, u.ord"#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| QueryFluxError::Persistence(format!("load_group_translation_bodies: {e}")))?;
-
-        let mut map: HashMap<String, Vec<String>> = HashMap::new();
-        for (name, body) in rows {
-            map.entry(name).or_default().push(body);
-        }
-        Ok(map)
     }
 }
 
@@ -830,6 +935,25 @@ impl ScriptLibraryStore for PostgresStore {
             .map_err(|e| QueryFluxError::Persistence(format!("delete_user_script: {e}")))?;
         Ok(r.rows_affected() > 0)
     }
+
+    async fn load_group_translation_bodies(&self) -> Result<HashMap<String, Vec<String>>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT g.name, s.body
+               FROM cluster_group_configs g
+               CROSS JOIN LATERAL unnest(g.translation_script_ids) WITH ORDINALITY AS u(sid, ord)
+               JOIN user_scripts s ON s.id = u.sid AND s.kind = 'translation_fixup'
+               ORDER BY g.name, u.ord"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("load_group_translation_bodies: {e}")))?;
+
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, body) in rows {
+            map.entry(name).or_default().push(body);
+        }
+        Ok(map)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,14 +1307,34 @@ impl Persistence for PostgresStore {
 
     async fn upsert_queued(&self, query: QueuedQuery) -> Result<()> {
         let id = query.id.0.clone();
+        let group = query.cluster_group.0.clone();
+        let last_accessed = query.last_accessed;
         let data = serde_json::to_value(&query)
             .map_err(|e| QueryFluxError::Persistence(format!("Serialize error: {e}")))?;
+        // Re-queues rebuild the QueuedQuery with a fresh creation_time; keep
+        // the original so it always means "first enqueued at" — the fairness
+        // gate orders waiters by it.
         sqlx::query(
-            "INSERT INTO queued_queries (id, data) VALUES ($1, $2)
-             ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+            r#"
+            INSERT INTO queued_queries (id, data, cluster_group, last_accessed)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (id) DO UPDATE SET
+                data = jsonb_set(
+                    EXCLUDED.data,
+                    '{creation_time}',
+                    COALESCE(
+                        queued_queries.data->'creation_time',
+                        EXCLUDED.data->'creation_time'
+                    )
+                ),
+                cluster_group = EXCLUDED.cluster_group,
+                last_accessed = EXCLUDED.last_accessed
+            "#,
         )
         .bind(&id)
         .bind(data)
+        .bind(&group)
+        .bind(last_accessed)
         .execute(&self.pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Upsert queued_queries: {e}")))?;
@@ -1237,21 +1381,54 @@ impl Persistence for PostgresStore {
             .collect()
     }
 
+    async fn touch_queued_last_accessed(&self, id: &ProxyQueryId) -> Result<()> {
+        sqlx::query("UPDATE queued_queries SET last_accessed = now() WHERE id = $1")
+            .bind(&id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("touch_queued_last_accessed: {e}")))?;
+        Ok(())
+    }
+
     async fn delete_queued_not_accessed_since(
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
-        // last_accessed is stored inside the JSONB data blob.
-        let result = sqlx::query(
-            "DELETE FROM queued_queries WHERE (data->>'last_accessed')::timestamptz < $1",
-        )
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            QueryFluxError::Persistence(format!("delete_queued_not_accessed_since: {e}"))
-        })?;
+        let result = sqlx::query("DELETE FROM queued_queries WHERE last_accessed < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                QueryFluxError::Persistence(format!("delete_queued_not_accessed_since: {e}"))
+            })?;
         Ok(result.rows_affected())
+    }
+
+    async fn count_active_queued_before(
+        &self,
+        cluster_group: &str,
+        enqueued_before: Option<DateTime<Utc>>,
+        active_after: DateTime<Utc>,
+    ) -> Result<u64> {
+        // creation_time is compared from the JSONB blob (preserved across
+        // re-queues by upsert_queued) so both sides of the comparison come
+        // from the application clock; the indexed columns narrow the scan.
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM queued_queries
+            WHERE cluster_group = $1
+              AND last_accessed >= $2
+              AND ($3::timestamptz IS NULL
+                   OR (data->>'creation_time')::timestamptz < $3)
+            "#,
+        )
+        .bind(cluster_group)
+        .bind(active_after)
+        .bind(enqueued_before)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("count_active_queued_before: {e}")))?;
+        Ok(count.max(0) as u64)
     }
 }
 
@@ -1404,5 +1581,878 @@ impl MetricsStore for PostgresStore {
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Insert cluster_snapshots: {e}")))?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConfigRevisionStore — Postgres (revision table + LISTEN/NOTIFY)
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl ConfigRevisionStore for PostgresStore {
+    async fn current_revision(&self) -> Result<u64> {
+        let row: (i64,) = sqlx::query_as("SELECT revision FROM config_revision WHERE id = TRUE")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("Read config_revision: {e}")))?;
+        Ok(row.0 as u64)
+    }
+
+    async fn bump_revision(&self) -> Result<u64> {
+        let row: (i64,) = sqlx::query_as(
+            "UPDATE config_revision SET revision = revision + 1, updated_at = now() WHERE id = TRUE RETURNING revision",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            QueryFluxError::Persistence(format!("Bump config_revision: {e}"))
+        })?;
+        Ok(row.0 as u64)
+    }
+
+    async fn subscribe_revisions(&self) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>> {
+        let pool = self.pool.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<u64>(16);
+
+        tokio::spawn(async move {
+            const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+            let mut backoff = std::time::Duration::from_secs(1);
+
+            'reconnect: loop {
+                let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::warn!("PgListener connect failed, retrying in {backoff:?}: {e}");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        continue;
+                    }
+                };
+
+                if let Err(e) = listener.listen("config_revision_changed").await {
+                    tracing::warn!("PgListener LISTEN failed, retrying in {backoff:?}: {e}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+
+                backoff = std::time::Duration::from_secs(1);
+
+                loop {
+                    match listener.recv().await {
+                        Ok(notification) => {
+                            let rev = notification.payload().parse::<u64>().unwrap_or(0);
+                            if tx.send(rev).await.is_err() {
+                                break 'reconnect;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "PgListener recv error, reconnecting in {backoff:?}: {e}"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(MAX_BACKOFF);
+                            break; // drop listener, reconnect from outer loop
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Some(rx))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CapacityStore — Postgres implementation
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl CapacityStore for PostgresStore {
+    async fn try_acquire(
+        &self,
+        cluster_name: &str,
+        max_running_queries: u64,
+        instance_id: &str,
+        query_id: &str,
+    ) -> Result<bool> {
+        let max_rq = max_running_queries.min(i64::MAX as u64) as i64;
+
+        // O(1) admission in a single statement: increment the per-cluster
+        // counter iff under the limit (the counter row's lock makes concurrent
+        // acquires for the same cluster serialize correctly; different clusters
+        // do not contend), and insert the lease only when granted.
+        //
+        // The first CTE's INSERT path covers the cluster's very first acquire
+        // (`WHERE $4 >= 1` keeps a zero limit denying); ON CONFLICT covers all
+        // later ones. If the lease insert hits a duplicate query_id (not
+        // reachable from current call sites — leases are released before any
+        // re-dispatch of the same query), the counter drifts +1 until the
+        // sweep's reconcile in expire_stale corrects it.
+        let result = sqlx::query_scalar::<_, bool>(
+            r#"
+            WITH up AS (
+                INSERT INTO cluster_capacity_counters AS c (cluster_name, running)
+                SELECT $1, 1 WHERE $4 >= 1
+                ON CONFLICT (cluster_name) DO UPDATE
+                    SET running = c.running + 1
+                    WHERE c.running < $4
+                RETURNING 1
+            ),
+            ins AS (
+                INSERT INTO cluster_capacity_leases (query_id, cluster_name, instance_id)
+                SELECT $3, $1, $2
+                WHERE EXISTS (SELECT 1 FROM up)
+                ON CONFLICT (query_id) DO NOTHING
+                RETURNING 1
+            )
+            SELECT EXISTS (SELECT 1 FROM ins)
+            "#,
+        )
+        .bind(cluster_name)
+        .bind(instance_id)
+        .bind(query_id)
+        .bind(max_rq)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("try_acquire: {e}")))?;
+
+        Ok(result)
+    }
+
+    async fn release(&self, _cluster_name: &str, query_id: &str) -> Result<()> {
+        // Delete the lease and decrement its cluster's counter in one
+        // statement. Idempotent: a second release deletes nothing, so the
+        // counter is not decremented twice.
+        sqlx::query(
+            r#"
+            WITH del AS (
+                DELETE FROM cluster_capacity_leases
+                WHERE query_id = $1
+                RETURNING cluster_name
+            )
+            UPDATE cluster_capacity_counters c
+            SET running = GREATEST(c.running - 1, 0)
+            FROM del
+            WHERE c.cluster_name = del.cluster_name
+            "#,
+        )
+        .bind(query_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("release: {e}")))?;
+        Ok(())
+    }
+
+    async fn heartbeat(&self, instance_id: &str) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE cluster_capacity_leases SET heartbeat_at = now() WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("heartbeat: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn expire_stale(&self, cutoff: DateTime<Utc>) -> Result<u64> {
+        // Known non-atomicity: DELETE + reconcile UPDATE are two separate statements.
+        // A new acquire can commit its lease row between them, causing the counter to
+        // be written one lower than the true lease count. Under-admission is the safe
+        // direction (one query slot is wasted, not over-allocated), and the next sweep
+        // cycle (~120 s) corrects any drift. We accept this over a heavier serializable
+        // transaction because the sweep runs infrequently and correctness is recovered.
+        let result = sqlx::query("DELETE FROM cluster_capacity_leases WHERE heartbeat_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("expire_stale: {e}")))?;
+
+        // Reconcile the admission counters from the leases (the ground truth):
+        // covers the rows just expired plus any drift from edge cases. An
+        // acquire committing between the two updates can be overwritten one
+        // low; the next cycle (120s) corrects it, and under-admission is the
+        // safe direction.
+        sqlx::query(
+            r#"
+            UPDATE cluster_capacity_counters c
+            SET running = sub.cnt
+            FROM (
+                SELECT cluster_name, COUNT(*) AS cnt
+                FROM cluster_capacity_leases
+                GROUP BY cluster_name
+            ) sub
+            WHERE c.cluster_name = sub.cluster_name AND c.running <> sub.cnt
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("expire_stale reconcile: {e}")))?;
+
+        sqlx::query(
+            r#"
+            UPDATE cluster_capacity_counters
+            SET running = 0
+            WHERE running <> 0
+              AND cluster_name NOT IN (SELECT cluster_name FROM cluster_capacity_leases)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("expire_stale zero: {e}")))?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn active_count(&self, cluster_name: &str) -> Result<u64> {
+        // O(1) counter read; reconciled from the leases table by the sweep.
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(
+                (SELECT running FROM cluster_capacity_counters WHERE cluster_name = $1),
+                0
+            )
+            "#,
+        )
+        .bind(cluster_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("active_count: {e}")))?;
+        Ok(count.max(0) as u64)
+    }
+
+    async fn release_all_for_instance(&self, instance_id: &str) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            WITH del AS (
+                DELETE FROM cluster_capacity_leases
+                WHERE instance_id = $1
+                RETURNING cluster_name
+            ),
+            counts AS (
+                SELECT cluster_name, COUNT(*) AS cnt
+                FROM del
+                GROUP BY cluster_name
+            )
+            UPDATE cluster_capacity_counters c
+            SET running = GREATEST(c.running - counts.cnt, 0)
+            FROM counts
+            WHERE c.cluster_name = counts.cluster_name
+            "#,
+        )
+        .bind(instance_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("release_all_for_instance: {e}")))?;
+        Ok(result.rows_affected())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QueueCoordinator — Postgres implementation
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl QueueCoordinator for PostgresStore {
+    async fn try_claim(
+        &self,
+        query_id: &str,
+        instance_id: &str,
+        stale_before: DateTime<Utc>,
+    ) -> Result<Option<QueuedQuery>> {
+        // Atomically claim a queued query that is unclaimed, or whose claim is
+        // stale (the claiming replica crashed mid-dispatch). The UPDATE's row
+        // lock makes concurrent takeover attempts serialize; only one wins.
+        let row: Option<(serde_json::Value,)> = sqlx::query_as(
+            r#"
+            UPDATE queued_queries
+            SET claimed_by = $2, claimed_at = now()
+            WHERE id = $1 AND (claimed_by IS NULL OR claimed_at < $3)
+            RETURNING data
+            "#,
+        )
+        .bind(query_id)
+        .bind(instance_id)
+        .bind(stale_before)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("try_claim: {e}")))?;
+
+        match row {
+            Some((data,)) => {
+                let q: QueuedQuery = serde_json::from_value(data).map_err(|e| {
+                    QueryFluxError::Persistence(format!("try_claim deserialize: {e}"))
+                })?;
+                Ok(Some(q))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn release_claim(&self, query_id: &str) -> Result<()> {
+        sqlx::query("UPDATE queued_queries SET claimed_by = NULL, claimed_at = NULL WHERE id = $1")
+            .bind(query_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| QueryFluxError::Persistence(format!("release_claim: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_unclaimed(&self, stale_before: DateTime<Utc>) -> Result<Vec<QueuedQuery>> {
+        let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+            r#"
+            SELECT data FROM queued_queries
+            WHERE claimed_by IS NULL OR claimed_at < $1
+            ORDER BY created_at
+            "#,
+        )
+        .bind(stale_before)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| QueryFluxError::Persistence(format!("list_unclaimed: {e}")))?;
+
+        let mut result = Vec::with_capacity(rows.len());
+        for (data,) in rows {
+            match serde_json::from_value::<QueuedQuery>(data) {
+                Ok(q) => result.push(q),
+                Err(e) => tracing::warn!("list_unclaimed: skipping malformed row: {e}"),
+            }
+        }
+        Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests — require a running Postgres with DATABASE_URL set.
+// Run with: cargo test -p queryflux-persistence -- --ignored postgres
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CapacityStore, ConfigRevisionStore, Persistence, QueueCoordinator};
+    use queryflux_core::query::{ClusterGroupName, FrontendProtocol, ProxyQueryId, QueuedQuery};
+    use queryflux_core::session::SessionContext;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    async fn test_store() -> PostgresStore {
+        let url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set for Postgres integration tests");
+        let store = PostgresStore::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        store
+    }
+
+    fn unique_id(prefix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{prefix}-{nanos}")
+    }
+
+    fn make_queued(id: &str) -> QueuedQuery {
+        QueuedQuery {
+            id: ProxyQueryId(id.to_string()),
+            sql: "SELECT 1".to_string(),
+            session: SessionContext::default(),
+            frontend_protocol: FrontendProtocol::TrinoHttp,
+            cluster_group: ClusterGroupName("test".to_string()),
+            creation_time: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+            sequence: 0,
+        }
+    }
+
+    /// A cutoff in the past: fresh claims are NOT stale relative to this.
+    fn no_stale() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::seconds(60)
+    }
+
+    /// Serializes the CapacityStore tests: `expire_stale` and `heartbeat` operate on
+    /// the whole `cluster_capacity_leases` table, so tests running in parallel would
+    /// delete or renew each other's leases.
+    static CAPACITY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    // -- ConfigRevisionStore ------------------------------------------------
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_config_revision_bump_and_read() {
+        let store = test_store().await;
+        let before = store.current_revision().await.unwrap();
+        let bumped = store.bump_revision().await.unwrap();
+        assert!(
+            bumped > before,
+            "bumped ({bumped}) should be > before ({before})"
+        );
+        let after = store.current_revision().await.unwrap();
+        assert_eq!(after, bumped);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_config_revision_subscribe() {
+        let store = test_store().await;
+        let rx = store.subscribe_revisions().await.unwrap();
+        assert!(
+            rx.is_some(),
+            "Postgres should return a notification receiver"
+        );
+    }
+
+    // -- CapacityStore ------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_acquire_release_cycle() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let qid = unique_id("cap");
+
+        let acquired = store
+            .try_acquire("test-cluster", u64::MAX, "inst-1", &qid)
+            .await
+            .unwrap();
+        assert!(acquired);
+
+        let count = store.active_count("test-cluster").await.unwrap();
+        assert!(count >= 1);
+
+        store.release("test-cluster", &qid).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_denies_at_caller_provided_limit() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("lim");
+
+        assert!(store
+            .try_acquire(&cluster, 2, "inst-1", &format!("{cluster}-q1"))
+            .await
+            .unwrap());
+        assert!(store
+            .try_acquire(&cluster, 2, "inst-1", &format!("{cluster}-q2"))
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .try_acquire(&cluster, 2, "inst-1", &format!("{cluster}-q3"))
+                .await
+                .unwrap(),
+            "third acquire must be denied at limit 2"
+        );
+
+        store
+            .release(&cluster, &format!("{cluster}-q1"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .try_acquire(&cluster, 2, "inst-1", &format!("{cluster}-q3"))
+                .await
+                .unwrap(),
+            "slot freed by release must be grantable again"
+        );
+
+        store
+            .release(&cluster, &format!("{cluster}-q2"))
+            .await
+            .unwrap();
+        store
+            .release(&cluster, &format!("{cluster}-q3"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_expire_stale_cleans_old_leases() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let qid = unique_id("exp");
+
+        store
+            .try_acquire("test-cluster-exp", u64::MAX, "inst-stale", &qid)
+            .await
+            .unwrap();
+
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let expired = store.expire_stale(far_future).await.unwrap();
+        assert!(
+            expired >= 1,
+            "should expire at least the lease we just created"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_concurrent_acquires_respect_limit() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = std::sync::Arc::new(test_store().await);
+        let cluster = unique_id("limited");
+        const LIMIT: u64 = 5;
+
+        // 4x the limit racing for slots: the advisory lock must serialize the
+        // count-then-insert so exactly LIMIT acquires win.
+        let mut handles = Vec::new();
+        for i in 0..(LIMIT * 4) {
+            let store = store.clone();
+            let cluster = cluster.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .try_acquire(
+                        &cluster,
+                        LIMIT,
+                        &format!("inst-{}", i % 3),
+                        &format!("{cluster}-q{i}"),
+                    )
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut granted = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                granted += 1;
+            }
+        }
+        assert_eq!(
+            granted, LIMIT,
+            "exactly the limit must be granted under contention"
+        );
+        assert_eq!(store.active_count(&cluster).await.unwrap(), LIMIT);
+
+        for i in 0..(LIMIT * 4) {
+            let _ = store.release(&cluster, &format!("{cluster}-q{i}")).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_counter_stays_consistent() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let cluster = unique_id("cnt");
+
+        for i in 1..=3 {
+            assert!(store
+                .try_acquire(&cluster, 10, "inst-1", &format!("{cluster}-q{i}"))
+                .await
+                .unwrap());
+        }
+        assert_eq!(store.active_count(&cluster).await.unwrap(), 3);
+
+        store
+            .release(&cluster, &format!("{cluster}-q2"))
+            .await
+            .unwrap();
+        assert_eq!(store.active_count(&cluster).await.unwrap(), 2);
+
+        // Double release is a no-op on the counter.
+        store
+            .release(&cluster, &format!("{cluster}-q2"))
+            .await
+            .unwrap();
+        assert_eq!(store.active_count(&cluster).await.unwrap(), 2);
+
+        // Expiring every lease reconciles the counter back to zero.
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        store.expire_stale(far_future).await.unwrap();
+        assert_eq!(store.active_count(&cluster).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_capacity_heartbeat_protects_leases_from_expiry() {
+        let _guard = CAPACITY_TEST_LOCK.lock().await;
+        let store = test_store().await;
+        let inst = unique_id("inst-hb");
+        let qid = unique_id("hb");
+
+        store
+            .try_acquire("test-cluster-hb", u64::MAX, &inst, &qid)
+            .await
+            .unwrap();
+
+        // Renew, then expire with a cutoff just before the renewal: the lease
+        // must survive because heartbeat_at was bumped past the cutoff.
+        // The cutoff must come from the *database* clock — heartbeat_at is written
+        // with the server's now(), and sub-second skew against the client clock
+        // makes a client-side cutoff flaky. (Production is insensitive: the expiry
+        // cutoff there has a 300s margin against a 60s heartbeat interval.)
+        let cutoff: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let renewed = store.heartbeat(&inst).await.unwrap();
+        assert!(renewed >= 1, "heartbeat should renew the lease we hold");
+
+        store.expire_stale(cutoff).await.unwrap();
+        let count = store.active_count("test-cluster-hb").await.unwrap();
+        assert!(count >= 1, "heartbeated lease must survive expiry");
+
+        store.release("test-cluster-hb", &qid).await.unwrap();
+    }
+
+    // -- Admission fairness ---------------------------------------------------
+
+    fn make_queued_at(
+        id: &str,
+        group: &str,
+        creation_time: chrono::DateTime<chrono::Utc>,
+        last_accessed: chrono::DateTime<chrono::Utc>,
+    ) -> QueuedQuery {
+        QueuedQuery {
+            id: ProxyQueryId(id.to_string()),
+            sql: "SELECT 1".to_string(),
+            session: SessionContext::default(),
+            frontend_protocol: FrontendProtocol::TrinoHttp,
+            cluster_group: ClusterGroupName(group.to_string()),
+            creation_time,
+            last_accessed,
+            sequence: 0,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_queued_creation_time_preserved_on_requeue() {
+        let store = test_store().await;
+        let qid = unique_id("ct");
+        let group = unique_id("g");
+        let original = chrono::Utc::now() - chrono::Duration::minutes(10);
+
+        store
+            .upsert_queued(make_queued_at(&qid, &group, original, chrono::Utc::now()))
+            .await
+            .unwrap();
+        // Re-queue with a fresh creation_time, as persist_queued_query does.
+        store
+            .upsert_queued(make_queued_at(
+                &qid,
+                &group,
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+            ))
+            .await
+            .unwrap();
+
+        let q = store
+            .get_queued(&ProxyQueryId(qid.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            q.creation_time.timestamp_millis(),
+            original.timestamp_millis(),
+            "creation_time must survive re-queues"
+        );
+        store.delete_queued(&ProxyQueryId(qid)).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_count_active_queued_before_orders_and_filters() {
+        let store = test_store().await;
+        let group = unique_id("fair");
+        let now = chrono::Utc::now();
+        let active_after = now - chrono::Duration::seconds(15);
+
+        let q_old = unique_id("old");
+        let q_new = unique_id("new");
+        let q_dead = unique_id("dead");
+        // Old and new are actively polling; dead stopped 10 minutes ago.
+        store
+            .upsert_queued(make_queued_at(
+                &q_old,
+                &group,
+                now - chrono::Duration::minutes(5),
+                now,
+            ))
+            .await
+            .unwrap();
+        store
+            .upsert_queued(make_queued_at(
+                &q_new,
+                &group,
+                now - chrono::Duration::seconds(2),
+                now,
+            ))
+            .await
+            .unwrap();
+        store
+            .upsert_queued(make_queued_at(
+                &q_dead,
+                &group,
+                now - chrono::Duration::minutes(20),
+                now - chrono::Duration::minutes(10),
+            ))
+            .await
+            .unwrap();
+
+        // A never-queued query sees both live waiters (dead client excluded).
+        assert_eq!(
+            store
+                .count_active_queued_before(&group, None, active_after)
+                .await
+                .unwrap(),
+            2
+        );
+        // The newer waiter sees only the older one ahead of it.
+        assert_eq!(
+            store
+                .count_active_queued_before(
+                    &group,
+                    Some(now - chrono::Duration::seconds(2)),
+                    active_after
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        // The oldest live waiter has nobody ahead.
+        assert_eq!(
+            store
+                .count_active_queued_before(
+                    &group,
+                    Some(now - chrono::Duration::minutes(5)),
+                    active_after
+                )
+                .await
+                .unwrap(),
+            0
+        );
+        // Other groups are unaffected.
+        assert_eq!(
+            store
+                .count_active_queued_before("some-other-group", None, active_after)
+                .await
+                .unwrap(),
+            0
+        );
+
+        for q in [q_old, q_new, q_dead] {
+            store.delete_queued(&ProxyQueryId(q)).await.unwrap();
+        }
+    }
+
+    // -- SweepLock ------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_sweep_lock_single_owner() {
+        let store = test_store().await;
+        let name = unique_id("sweep");
+
+        let first = store.try_sweep_lock(&name).await.unwrap();
+        assert!(first.is_some(), "first lock attempt should succeed");
+
+        let second = store.try_sweep_lock(&name).await.unwrap();
+        assert!(second.is_none(), "lock must not be granted twice");
+
+        // A different sweep name does not contend.
+        let other = store
+            .try_sweep_lock(&format!("{name}-other"))
+            .await
+            .unwrap();
+        assert!(other.is_some(), "different sweep names are independent");
+        other.unwrap().release().await;
+
+        first.unwrap().release().await;
+        let reacquired = store.try_sweep_lock(&name).await.unwrap();
+        assert!(reacquired.is_some(), "lock must be grantable after release");
+        reacquired.unwrap().release().await;
+    }
+
+    // -- QueueCoordinator ---------------------------------------------------
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_queue_claim_grants_once() {
+        let store = test_store().await;
+        let qid = unique_id("qc");
+
+        store.upsert_queued(make_queued(&qid)).await.unwrap();
+
+        let first = store.try_claim(&qid, "inst-A", no_stale()).await.unwrap();
+        assert!(first.is_some(), "first claim should succeed");
+
+        let second = store.try_claim(&qid, "inst-B", no_stale()).await.unwrap();
+        assert!(
+            second.is_none(),
+            "second claim by different instance should fail"
+        );
+
+        store.delete_queued(&ProxyQueryId(qid)).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_queue_stale_claim_can_be_taken_over() {
+        let store = test_store().await;
+        let qid = unique_id("st");
+
+        store.upsert_queued(make_queued(&qid)).await.unwrap();
+        store
+            .try_claim(&qid, "inst-dead", no_stale())
+            .await
+            .unwrap();
+
+        // A cutoff in the future makes the fresh claim count as stale,
+        // simulating a claim whose owner crashed long ago.
+        let all_stale = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let taken = store.try_claim(&qid, "inst-B", all_stale).await.unwrap();
+        assert!(taken.is_some(), "stale claim should be taken over");
+
+        store.delete_queued(&ProxyQueryId(qid)).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_queue_release_claim_allows_reclaim() {
+        let store = test_store().await;
+        let qid = unique_id("rc");
+
+        store.upsert_queued(make_queued(&qid)).await.unwrap();
+        store.try_claim(&qid, "inst-A", no_stale()).await.unwrap();
+
+        store.release_claim(&qid).await.unwrap();
+
+        let reclaimed = store.try_claim(&qid, "inst-B", no_stale()).await.unwrap();
+        assert!(
+            reclaimed.is_some(),
+            "after release, another instance should claim"
+        );
+
+        store.delete_queued(&ProxyQueryId(qid)).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn pg_queue_list_unclaimed_excludes_claimed() {
+        let store = test_store().await;
+        let qid1 = unique_id("uc1");
+        let qid2 = unique_id("uc2");
+
+        store.upsert_queued(make_queued(&qid1)).await.unwrap();
+        store.upsert_queued(make_queued(&qid2)).await.unwrap();
+
+        store.try_claim(&qid1, "inst-A", no_stale()).await.unwrap();
+
+        let unclaimed = store.list_unclaimed(no_stale()).await.unwrap();
+        let unclaimed_ids: Vec<&str> = unclaimed.iter().map(|q| q.id.0.as_str()).collect();
+        assert!(
+            !unclaimed_ids.contains(&qid1.as_str()),
+            "claimed query should not appear"
+        );
+        assert!(
+            unclaimed_ids.contains(&qid2.as_str()),
+            "unclaimed query should appear"
+        );
+
+        store.delete_queued(&ProxyQueryId(qid1)).await.unwrap();
+        store.delete_queued(&ProxyQueryId(qid2)).await.unwrap();
     }
 }

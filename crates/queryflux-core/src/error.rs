@@ -45,3 +45,42 @@ pub enum QueryFluxError {
 }
 
 pub type Result<T> = std::result::Result<T, QueryFluxError>;
+
+impl QueryFluxError {
+    /// Returns `true` if the error is likely transient and the operation may
+    /// succeed on retry (e.g. connection refused, pool timeout, serialization
+    /// conflict). Returns `false` for permanent failures like constraint
+    /// violations, auth errors, or bad input.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            // Persistence errors: inspect the message for sqlx error kinds.
+            // Connection-level and pool errors are transient; constraint
+            // violations and type errors are permanent.
+            QueryFluxError::Persistence(msg) => {
+                let m = msg.to_lowercase();
+                m.contains("connection refused")
+                    || m.contains("connection reset")
+                    || m.contains("broken pipe")
+                    || m.contains("pool timed out")
+                    || m.contains("timed out")
+                    || m.contains("could not connect")
+                    // Postgres serialization failure (40001) — safe to retry
+                    || m.contains("40001")
+                    || m.contains("serialization failure")
+                    || m.contains("deadlock detected")
+            }
+            // Engine errors may be transient (backend temporarily unavailable).
+            QueryFluxError::Engine(msg) => {
+                let m = msg.to_lowercase();
+                m.contains("connection refused")
+                    || m.contains("timed out")
+                    || m.contains("unavailable")
+                    || m.contains("503")
+                    || m.contains("429")
+            }
+            // Everything else is permanent: auth failures, bad input, routing
+            // misses, config errors, not-found, etc.
+            _ => false,
+        }
+    }
+}

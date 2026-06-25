@@ -22,7 +22,7 @@ use queryflux_core::{
 use queryflux_metrics::prometheus_store::PrometheusMetrics;
 use queryflux_persistence::{
     cluster_config::{
-        ClusterGroupConfigRecord, RenameConfigRequest, UpsertClusterConfig,
+        ClusterConfigRecord, ClusterGroupConfigRecord, RenameConfigRequest, UpsertClusterConfig,
         UpsertClusterGroupConfig,
     },
     query_history::{
@@ -42,7 +42,7 @@ use utoipa::{OpenApi, ToSchema};
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::{state::LiveConfig, FrontendListenerTrait};
+use crate::{state::LiveConfig, FrontendListenerTrait, ShutdownRx};
 
 /// Callback type for testing a cluster config without persisting it.
 /// Receives `(engine_key, config_json)` → returns `Ok(true)` if healthy, `Ok(false)` if
@@ -305,12 +305,26 @@ pub fn build_frontends_status(
             "Arrow Flight SQL / gRPC-style access (driver-dependent).",
             frontends.flight_sql.as_ref(),
         ),
-        opt_fe(
-            "snowflake_http",
-            "Snowflake HTTP",
-            "Snowflake wire protocol + SQL API v2 on one port (session and query endpoints).",
-            frontends.snowflake_http.as_ref(),
-        ),
+        match &frontends.snowflake_http {
+            None => ProtocolFrontendDto {
+                id: "snowflake_http".to_string(),
+                label: "Snowflake HTTP".to_string(),
+                short_description:
+                    "Snowflake wire protocol + SQL API v2 on one port (session and query endpoints)."
+                        .to_string(),
+                enabled: false,
+                port: None,
+            },
+            Some(c) => ProtocolFrontendDto {
+                id: "snowflake_http".to_string(),
+                label: "Snowflake HTTP".to_string(),
+                short_description:
+                    "Snowflake wire protocol + SQL API v2 on one port (session and query endpoints)."
+                        .to_string(),
+                enabled: c.enabled,
+                port: Some(c.port),
+            },
+        },
     ];
 
     FrontendsStatusDto {
@@ -466,7 +480,9 @@ struct AdminState {
     security_config: Arc<SecurityConfigDto>,
     routing_config: Arc<RoutingConfigDto>,
     engine_registry: Arc<EngineRegistry>,
-    /// Wake the config reload task immediately after mutating persisted cluster/group/routing config.
+    /// Wake the config reload task immediately after mutating persisted config.
+    /// Uses `ConfigRevisionStore::bump_revision()` for distributed notification
+    /// and falls back to `tokio::sync::Notify` for in-memory/local-only mode.
     config_reload_notify: Arc<tokio::sync::Notify>,
     /// Snapshot of protocol listeners from startup config (YAML); not hot-reloaded.
     frontends_status: FrontendsStatusDto,
@@ -492,6 +508,7 @@ pub struct AdminFrontend {
     frontends_status: FrontendsStatusDto,
     admin_creds: Arc<AdminCredentialsManager>,
     test_cluster_fn: TestClusterFn,
+    cors_allowed_origins: Vec<String>,
 }
 
 impl AdminFrontend {
@@ -508,6 +525,7 @@ impl AdminFrontend {
         frontends_status: FrontendsStatusDto,
         admin_creds: Arc<AdminCredentialsManager>,
         test_cluster_fn: TestClusterFn,
+        cors_allowed_origins: Vec<String>,
     ) -> Self {
         Self {
             prometheus,
@@ -521,6 +539,7 @@ impl AdminFrontend {
             frontends_status,
             admin_creds,
             test_cluster_fn,
+            cors_allowed_origins,
         }
     }
 
@@ -544,6 +563,8 @@ impl AdminFrontend {
         // Public routes — no authentication required.
         let public = Router::new()
             .route("/health", get(health_handler))
+            .route("/readyz", get(readiness_handler))
+            // SECURITY: /metrics should be network-restricted in production (firewall or separate listener)
             .route("/metrics", get(metrics_handler))
             .route(
                 "/openapi.json",
@@ -629,29 +650,48 @@ impl AdminFrontend {
                 admin_auth_middleware,
             ));
 
+        let cors = if self.cors_allowed_origins.is_empty() {
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([
+                    Method::GET,
+                    Method::PATCH,
+                    Method::PUT,
+                    Method::POST,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers(Any)
+        } else {
+            let origins: Vec<axum::http::HeaderValue> = self
+                .cors_allowed_origins
+                .iter()
+                .filter_map(|o| o.parse().ok())
+                .collect();
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods([
+                    Method::GET,
+                    Method::PATCH,
+                    Method::PUT,
+                    Method::POST,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers(Any)
+        };
+
         Router::new()
             .merge(public)
             .merge(protected)
             .with_state(state)
-            .layer(
-                CorsLayer::new()
-                    .allow_origin(Any)
-                    .allow_methods([
-                        Method::GET,
-                        Method::PATCH,
-                        Method::PUT,
-                        Method::POST,
-                        Method::DELETE,
-                        Method::OPTIONS,
-                    ])
-                    .allow_headers(Any),
-            )
+            .layer(cors)
     }
 }
 
 #[async_trait::async_trait]
 impl FrontendListenerTrait for AdminFrontend {
-    async fn listen(&self) -> Result<()> {
+    async fn listen(&self, mut shutdown: ShutdownRx) -> Result<()> {
         let addr = format!("0.0.0.0:{}", self.port);
         info!(
             "Admin server listening on {addr}  — Prometheus: {addr}/metrics  Swagger UI: {addr}/docs"
@@ -660,6 +700,9 @@ impl FrontendListenerTrait for AdminFrontend {
             .await
             .map_err(|e| queryflux_core::error::QueryFluxError::Engine(e.to_string()))?;
         axum::serve(listener, self.router())
+            .with_graceful_shutdown(async move {
+                let _ = shutdown.changed().await;
+            })
             .await
             .map_err(|e| queryflux_core::error::QueryFluxError::Engine(e.to_string()))?;
         Ok(())
@@ -783,7 +826,7 @@ async fn change_password_handler(
 // Standard handlers
 // ---------------------------------------------------------------------------
 
-/// Liveness probe.
+/// Liveness probe — unconditionally returns 200 to indicate the process is alive.
 #[utoipa::path(
     get,
     path = "/health",
@@ -792,6 +835,36 @@ async fn change_password_handler(
 )]
 async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+/// Readiness probe — returns 200 only when the proxy has at least one configured
+/// cluster group with a non-empty adapter set. Kubernetes should use this for the
+/// `readinessProbe` so traffic is not routed to a replica that hasn't finished
+/// loading its config (or whose last reload left it with zero adapters).
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Service is ready to accept traffic", body = str),
+        (status = 503, description = "Service is not yet ready", body = str),
+    )
+)]
+async fn readiness_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    let live = state.live.read().await;
+    if live.adapters.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no adapters loaded").into_response();
+    }
+    let cm = live.cluster_manager.clone();
+    drop(live);
+
+    match cm.all_cluster_states().await {
+        Ok(states) if states.is_empty() => {
+            (StatusCode::SERVICE_UNAVAILABLE, "no cluster groups").into_response()
+        }
+        Ok(_) => (StatusCode::OK, "ready").into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "cluster manager error").into_response(),
+    }
 }
 
 /// Protocol frontends enabled at process start (from YAML). Not hot-reloaded.
@@ -1168,14 +1241,51 @@ async fn update_cluster_handler(
 // Persisted cluster config CRUD
 // ---------------------------------------------------------------------------
 
-macro_rules! require_pg {
+/// Redact sensitive fields from a cluster config JSON value in-place.
+fn redact_cluster_config_secrets(config: &mut serde_json::Value) {
+    if let Some(obj) = config.as_object_mut() {
+        for key in [
+            "authPassword",
+            "password",
+            "authToken",
+            "awsSecretAccessKey",
+            "secretAccessKey",
+            "token",
+        ] {
+            if obj.contains_key(key) {
+                obj.insert(
+                    key.to_string(),
+                    serde_json::Value::String("***REDACTED***".to_string()),
+                );
+            }
+        }
+        for (_, val) in obj.iter_mut() {
+            if val.is_object() {
+                redact_cluster_config_secrets(val);
+            } else if let Some(arr) = val.as_array_mut() {
+                for item in arr.iter_mut() {
+                    redact_cluster_config_secrets(item);
+                }
+            }
+        }
+    }
+}
+
+/// Clone a `ClusterConfigRecord` with secrets redacted from the `config` field.
+fn redacted_cluster_config(record: ClusterConfigRecord) -> ClusterConfigRecord {
+    let mut record = record;
+    redact_cluster_config_secrets(&mut record.config);
+    record
+}
+
+macro_rules! require_store {
     ($state:expr) => {
         match &$state.admin_store {
-            Some(pg) => pg,
+            Some(store) => store,
             None => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Postgres persistence not configured",
+                    "Persistent backend not configured",
                 )
                     .into_response()
             }
@@ -1183,8 +1293,21 @@ macro_rules! require_pg {
     };
 }
 
-#[inline]
+/// Notify all QueryFlux replicas that config has changed.
+///
+/// When a persistence backend with `ConfigRevisionStore` is available (e.g.
+/// Postgres), bumps the shared revision counter which triggers `LISTEN/NOTIFY`
+/// to all replicas. Always also wakes the local reload task via `Notify` as a
+/// fast-path for the instance that made the change.
 fn notify_live_config_reload(state: &AdminState) {
+    if let Some(store) = &state.admin_store {
+        let store = store.clone();
+        tokio::spawn(async move {
+            if let Err(e) = store.bump_revision().await {
+                tracing::warn!("Failed to bump config revision: {e}");
+            }
+        });
+    }
     state.config_reload_notify.notify_one();
 }
 
@@ -1213,9 +1336,13 @@ fn rename_persistence_error_status(e: &queryflux_core::error::QueryFluxError) ->
     )
 )]
 async fn list_cluster_configs_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.list_cluster_configs().await {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(rows) => {
+            let redacted: Vec<ClusterConfigRecord> =
+                rows.into_iter().map(redacted_cluster_config).collect();
+            Json(redacted).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -1237,9 +1364,9 @@ async fn get_cluster_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.get_cluster_config(&name).await {
-        Ok(Some(r)) => Json(r).into_response(),
+        Ok(Some(r)) => Json(redacted_cluster_config(r)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Cluster config not found").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -1263,11 +1390,11 @@ async fn upsert_cluster_config_handler(
     Path(name): Path<String>,
     Json(body): Json<UpsertClusterConfig>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.upsert_cluster_config(&name, &body).await {
         Ok(r) => {
             notify_live_config_reload(&state);
-            Json(r).into_response()
+            Json(redacted_cluster_config(r)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -1292,11 +1419,11 @@ async fn rename_cluster_config_handler(
     Path(name): Path<String>,
     Json(body): Json<RenameConfigRequest>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.rename_cluster_config(&name, &body.new_name).await {
         Ok(r) => {
             notify_live_config_reload(&state);
-            Json(r).into_response()
+            Json(redacted_cluster_config(r)).into_response()
         }
         Err(e) => (rename_persistence_error_status(&e), e.to_string()).into_response(),
     }
@@ -1319,7 +1446,7 @@ async fn delete_cluster_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.delete_cluster_config(&name).await {
         Ok(true) => {
             notify_live_config_reload(&state);
@@ -1393,7 +1520,7 @@ async fn test_cluster_config_handler(
     )
 )]
 async fn list_group_configs_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.list_group_configs().await {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1417,7 +1544,7 @@ async fn get_group_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.get_group_config(&name).await {
         Ok(Some(r)) => Json(r).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Group config not found").into_response(),
@@ -1443,7 +1570,7 @@ async fn upsert_group_config_handler(
     Path(name): Path<String>,
     Json(body): Json<UpsertClusterGroupConfig>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.upsert_group_config(&name, &body).await {
         Ok(r) => {
             notify_live_config_reload(&state);
@@ -1472,7 +1599,7 @@ async fn rename_group_config_handler(
     Path(name): Path<String>,
     Json(body): Json<RenameConfigRequest>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.rename_group_config(&name, &body.new_name).await {
         Ok(r) => {
             notify_live_config_reload(&state);
@@ -1500,7 +1627,7 @@ async fn delete_group_config_handler(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.delete_group_config(&name).await {
         Ok(true) => {
             notify_live_config_reload(&state);
@@ -1546,7 +1673,7 @@ async fn list_user_scripts_handler(
     State(state): State<Arc<AdminState>>,
     Query(q): Query<UserScriptListQuery>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     let kind = q.kind.as_deref().filter(|s| !s.is_empty());
     match pg.list_user_scripts(kind).await {
         Ok(rows) => Json(rows).into_response(),
@@ -1570,7 +1697,7 @@ async fn create_user_script_handler(
     State(state): State<Arc<AdminState>>,
     Json(body): Json<UpsertUserScript>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.create_user_script(&body).await {
         Ok(r) => {
             notify_live_config_reload(&state);
@@ -1597,7 +1724,7 @@ async fn get_user_script_handler(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.get_user_script(id).await {
         Ok(Some(r)) => Json(r).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Script not found").into_response(),
@@ -1623,7 +1750,7 @@ async fn update_user_script_handler(
     Path(id): Path<i64>,
     Json(body): Json<UpsertUserScript>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.update_user_script(id, &body).await {
         Ok(r) => {
             notify_live_config_reload(&state);
@@ -1650,7 +1777,7 @@ async fn delete_user_script_handler(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let pg = require_pg!(state);
+    let pg = require_store!(state);
     match pg.delete_user_script(id).await {
         Ok(true) => {
             notify_live_config_reload(&state);
@@ -1761,7 +1888,10 @@ async fn put_security_config_handler(
     };
     let value = serde_json::to_value(&body).unwrap_or(serde_json::Value::Null);
     match store.set_proxy_setting("security_config", value).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            notify_live_config_reload(&state);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

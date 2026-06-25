@@ -1,3 +1,17 @@
+# ─── PRODUCTION CHECKLIST ─────────────────────────────────────────────────────
+# The defaults below are tuned for a quick local evaluation, NOT for production.
+# Before going live, review and change at minimum:
+#
+#   1. replicaCount       → ≥ 2 for HA
+#   2. adminCredentials   → set a strong password (or use existingSecret)
+#   3. persistence.type   → postgres (inMemory loses state on restart)
+#   4. auth.provider      → oidc / ldap / static (none = unauthenticated)
+#   5. auth.required      → true
+#   6. resources          → set CPU/memory requests and limits
+#   7. ingress / TLS      → enable HTTPS termination
+#   8. config.existingSecret → use when config contains credentials
+# ──────────────────────────────────────────────────────────────────────────────
+
 replicaCount: 1
 
 image:
@@ -42,6 +56,7 @@ securityContext:
   runAsGroup: 1000
 
 adminCredentials:
+  # WARNING: Change these for production! Default admin/admin is insecure.
   username: admin
   # Leave empty to generate a release-local password in a Secret.
   password: ""
@@ -71,6 +86,7 @@ config:
           enabled: true
           port: 8080
       persistence:
+        # WARNING: inMemory loses all state on pod restart. Use 'postgres' for production.
         type: inMemory
       adminApi:
         port: 9000
@@ -146,6 +162,8 @@ ingress:
           servicePortName: trino-http
   tls: []
 
+# WARNING: Resource requests below are minimal for local evaluation.
+# For production, set requests ≥ 500m CPU / 512Mi memory and appropriate limits.
 resources:
   requests:
     cpu: 100m
@@ -164,7 +182,7 @@ livenessProbe:
 
 readinessProbe:
   httpGet:
-    path: /health
+    path: /readyz
     port: admin
   initialDelaySeconds: 3
   periodSeconds: 5

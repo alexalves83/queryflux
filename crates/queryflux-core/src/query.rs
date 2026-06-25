@@ -257,10 +257,10 @@ pub struct ExecutingQuery {
     /// The backend engine's query ID (e.g. Trino's `20260319_084733_00386_kqwci`).
     /// Used as the persistence key and embedded in the client-facing poll URL.
     pub backend_query_id: BackendQueryId,
-    /// The Trino cluster base URL (e.g. `http://trino:8080`).
-    /// Used to reconstruct the Trino poll URL from the client-supplied path.
-    /// Never changes after submit — no updates needed between polls.
-    pub trino_endpoint: String,
+    /// Opaque base URL for the backend cluster (e.g. `http://trino:8080`).
+    /// The poll handler uses this together with the client-supplied path to reconstruct
+    /// the backend poll URL. Never changes after submit.
+    pub poll_base_url: Option<String>,
     pub creation_time: DateTime<Utc>,
     pub last_accessed: DateTime<Utc>,
     /// Effective tags at submit time (group defaults merged with session tags).
@@ -296,38 +296,50 @@ pub struct QueuedQuery {
     pub sequence: u64,
 }
 
-/// Returned by `EngineAdapterTrait::submit_query` for async (Trino) backends.
-/// Sync backends (DuckDB, StarRocks) use `execute_as_arrow` instead.
+/// Returned by `AsyncAdapter::submit_query`.
+///
+/// `Running` — query is executing; the client must poll using `poll_token`.
+/// `Completed` — query finished on the initial submit (fast queries, immediate errors).
+///   Dispatch records the outcome and releases the slot without waiting for any poll.
 #[derive(Debug)]
 pub enum QueryExecution {
-    Async {
+    Running {
         backend_query_id: BackendQueryId,
-        /// The backend's next polling URL (stored in persistence, never sent to client).
-        next_uri: Option<String>,
-        /// Raw response bytes from the first submit call (e.g. Trino JSON).
-        /// When present, the frontend rewrites nextUri and returns this directly.
-        initial_body: Option<Bytes>,
+        /// Opaque polling hint — each adapter interprets this in its own way.
+        /// Trino puts the full `nextUri` URL here; other engines may use a job ID.
+        poll_token: Option<String>,
+        /// Raw bytes from the initial submit response, forwarded as-is to the client.
+        initial_response: Option<Bytes>,
+    },
+    Completed {
+        backend_query_id: BackendQueryId,
+        status: QueryStatus,
+        error: Option<String>,
+        engine_stats: Option<QueryEngineStats>,
+        /// Raw bytes from the terminal submit response, forwarded as-is to the client.
+        initial_response: Option<Bytes>,
     },
 }
 
-/// Returned by `EngineAdapterTrait::poll_query` for async (Trino) backends.
+/// Returned by `AsyncAdapter::poll_query`.
 #[derive(Debug)]
 pub enum QueryPollResult {
     Pending {
         progress: Option<f32>,
-        next_uri: Option<String>,
+        /// Opaque polling hint for the next poll (same semantics as `QueryExecution::Running.poll_token`).
+        poll_token: Option<String>,
     },
     Failed {
         message: String,
         error_code: Option<String>,
     },
-    /// Raw response bytes for transparent protocol forwarding (Trino → Trino).
-    /// The frontend rewrites nextUri and returns the bytes directly to the client.
+    /// Raw response bytes for transparent protocol forwarding (e.g. Trino → Trino HTTP).
+    /// The frontend handler rewrites any embedded poll URL and returns the bytes as-is.
     Raw {
         body: Bytes,
-        /// The backend's next polling URL (None means query is complete).
-        next_uri: Option<String>,
-        /// Engine stats extracted from the final response (only set when next_uri is None).
+        /// Opaque polling hint for the next poll (None means query is complete).
+        poll_token: Option<String>,
+        /// Engine stats extracted from the final response (only set when poll_token is None).
         engine_stats: Option<QueryEngineStats>,
     },
 }

@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use async_trait::async_trait;
@@ -22,14 +23,23 @@ use crate::{
     script_library::{
         is_valid_script_kind, UpsertUserScript, UserScriptRecord, KIND_TRANSLATION_FIXUP,
     },
-    ClusterConfigStore, LoadedRoutingConfig, Persistence, ProxySettingsStore, QueryHistoryStore,
-    RoutingConfigStore, ScriptLibraryStore,
+    BackendCapabilities, CapacityStore, ClusterConfigStore, ConfigRevisionStore,
+    LoadedRoutingConfig, Persistence, ProxySettingsStore, QueryHistoryStore, QueueCoordinator,
+    RoutingConfigStore, ScriptLibraryStore, SweepCoordinator, SweepGuard,
 };
 
 pub struct InMemoryPersistence {
     // --- in-flight state ---
     /// Keyed by BackendQueryId (Trino's query ID) — matches the client poll URL.
+    ///
+    /// Intentionally unbounded: entries represent active in-flight queries and are
+    /// removed as soon as they complete or are cancelled. A hard cap would cause
+    /// legitimate queries to be silently dropped. The `max_running_queries` enforced
+    /// by `ClusterState` / `CapacityStore` is the upstream guard on entry count.
+    /// Production deployments should use the Postgres backend.
     executing: DashMap<String, ExecutingQuery>,
+    /// See note on `executing` above. Entry count is bounded by `max_queued_queries`
+    /// enforced at enqueue time; stale entries are swept by `delete_queued_not_accessed_since`.
     queued: DashMap<String, QueuedQuery>,
 
     // --- query history (write side) ---
@@ -48,6 +58,9 @@ pub struct InMemoryPersistence {
 
     // --- proxy-level settings ---
     proxy_settings: std::sync::RwLock<std::collections::HashMap<String, serde_json::Value>>,
+
+    // --- distributed-mode coordination (single-instance no-ops) ---
+    config_revision: AtomicU64,
 }
 
 impl Default for InMemoryPersistence {
@@ -65,6 +78,7 @@ impl Default for InMemoryPersistence {
             user_scripts: DashMap::default(),
             next_script_id: AtomicI64::new(1),
             proxy_settings: std::sync::RwLock::new(std::collections::HashMap::new()),
+            config_revision: AtomicU64::new(0),
         }
     }
 }
@@ -147,7 +161,13 @@ impl Persistence for InMemoryPersistence {
         Ok(self.executing.iter().map(|e| e.value().clone()).collect())
     }
 
-    async fn upsert_queued(&self, query: QueuedQuery) -> Result<()> {
+    async fn upsert_queued(&self, mut query: QueuedQuery) -> Result<()> {
+        // Re-queues rebuild the QueuedQuery with a fresh creation_time; keep
+        // the original so it always means "first enqueued at" — the fairness
+        // gate orders waiters by it.
+        if let Some(existing) = self.queued.get(&query.id.0) {
+            query.creation_time = existing.creation_time;
+        }
         self.queued.insert(query.id.0.clone(), query);
         Ok(())
     }
@@ -162,6 +182,13 @@ impl Persistence for InMemoryPersistence {
         Ok(self.queued.iter().map(|e| e.value().clone()).collect())
     }
 
+    async fn touch_queued_last_accessed(&self, id: &ProxyQueryId) -> Result<()> {
+        if let Some(mut entry) = self.queued.get_mut(&id.0) {
+            entry.last_accessed = Utc::now();
+        }
+        Ok(())
+    }
+
     async fn delete_queued_not_accessed_since(&self, cutoff: DateTime<Utc>) -> Result<u64> {
         let mut removed = 0u64;
         self.queued.retain(|_, q| {
@@ -174,17 +201,47 @@ impl Persistence for InMemoryPersistence {
         });
         Ok(removed)
     }
+
+    async fn count_active_queued_before(
+        &self,
+        cluster_group: &str,
+        enqueued_before: Option<DateTime<Utc>>,
+        active_after: DateTime<Utc>,
+    ) -> Result<u64> {
+        Ok(self
+            .queued
+            .iter()
+            .filter(|e| {
+                let q = e.value();
+                q.cluster_group.0 == cluster_group
+                    && q.last_accessed >= active_after
+                    && enqueued_before.is_none_or(|t| q.creation_time < t)
+            })
+            .count() as u64)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // MetricsStore — write completed query records and cluster snapshots
 // ---------------------------------------------------------------------------
 
+/// Maximum number of query records retained in memory. Oldest entries are
+/// evicted when the cap is reached so that long-running single-instance
+/// deployments don't grow without bound. Production deployments should use
+/// the Postgres backend; this store is intended for development only.
+const QUERY_RECORDS_MAX: usize = 10_000;
+
 #[async_trait]
 impl MetricsStore for InMemoryPersistence {
     async fn record_query(&self, record: QueryRecord) -> Result<()> {
         let summary = self.record_to_summary(record);
-        self.query_records.write().unwrap().push(summary);
+        let mut records = self.query_records.write().unwrap();
+        if records.len() >= QUERY_RECORDS_MAX {
+            // Evict the oldest quarter to amortize the cost of repeated trimming.
+            let drain_count = QUERY_RECORDS_MAX / 4;
+            records.drain(..drain_count);
+        }
+        records.push(summary);
         Ok(())
     }
 
@@ -331,6 +388,13 @@ impl QueryHistoryStore for InMemoryPersistence {
 
     async fn get_conversation(&self, _conversation_id: &str) -> Result<Vec<QuerySummary>> {
         Ok(vec![])
+    }
+
+    async fn purge_old_query_records(&self, older_than: DateTime<Utc>) -> Result<u64> {
+        let mut records = self.query_records.write().unwrap();
+        let before = records.len();
+        records.retain(|r| r.created_at >= older_than);
+        Ok((before - records.len()) as u64)
     }
 }
 
@@ -693,6 +757,136 @@ impl ScriptLibraryStore for InMemoryPersistence {
         }
         Ok(self.user_scripts.remove(&id).is_some())
     }
+
+    async fn load_group_translation_bodies(&self) -> Result<HashMap<String, Vec<String>>> {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for group in self.group_configs.iter() {
+            let bodies: Vec<String> = group
+                .translation_script_ids
+                .iter()
+                .filter_map(|sid| {
+                    self.user_scripts
+                        .get(sid)
+                        .filter(|s| s.kind == KIND_TRANSLATION_FIXUP)
+                        .map(|s| s.body.clone())
+                })
+                .collect();
+            if !bodies.is_empty() {
+                map.insert(group.name.clone(), bodies);
+            }
+        }
+        Ok(map)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConfigRevisionStore — local atomic counter (single-instance, no push)
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl ConfigRevisionStore for InMemoryPersistence {
+    async fn current_revision(&self) -> Result<u64> {
+        Ok(self.config_revision.load(Ordering::Relaxed))
+    }
+
+    async fn bump_revision(&self) -> Result<u64> {
+        Ok(self.config_revision.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    async fn subscribe_revisions(&self) -> Result<Option<tokio::sync::mpsc::Receiver<u64>>> {
+        // In-memory mode has no cross-process notification; callers poll.
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CapacityStore — pass-through (single-instance, no coordination needed)
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl CapacityStore for InMemoryPersistence {
+    async fn try_acquire(
+        &self,
+        _cluster_name: &str,
+        _max_running_queries: u64,
+        _instance_id: &str,
+        _query_id: &str,
+    ) -> Result<bool> {
+        // Single instance — capacity is managed by local ClusterState atomics.
+        Ok(true)
+    }
+
+    async fn release(&self, _cluster_name: &str, _query_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn heartbeat(&self, _instance_id: &str) -> Result<u64> {
+        Ok(0)
+    }
+
+    async fn expire_stale(&self, _cutoff: DateTime<Utc>) -> Result<u64> {
+        Ok(0)
+    }
+
+    async fn active_count(&self, _cluster_name: &str) -> Result<u64> {
+        // In-memory mode: local ClusterState is the source of truth.
+        Ok(0)
+    }
+
+    async fn release_all_for_instance(&self, _instance_id: &str) -> Result<u64> {
+        // Single instance — nothing to release.
+        Ok(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QueueCoordinator — pass-through (single-instance, no contention)
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl QueueCoordinator for InMemoryPersistence {
+    async fn try_claim(
+        &self,
+        query_id: &str,
+        _instance_id: &str,
+        _stale_before: DateTime<Utc>,
+    ) -> Result<Option<QueuedQuery>> {
+        // Single instance — always grant the claim; just look up the query.
+        Ok(self.queued.get(query_id).map(|e| e.value().clone()))
+    }
+
+    async fn release_claim(&self, _query_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list_unclaimed(&self, _stale_before: DateTime<Utc>) -> Result<Vec<QueuedQuery>> {
+        // Single instance — all queued queries are effectively unclaimed.
+        Ok(self.queued.iter().map(|e| e.value().clone()).collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SweepCoordinator — pass-through (single instance always owns every sweep)
+// ---------------------------------------------------------------------------
+
+struct NoopSweepGuard;
+
+#[async_trait]
+impl SweepGuard for NoopSweepGuard {
+    async fn release(self: Box<Self>) {}
+}
+
+#[async_trait]
+impl SweepCoordinator for InMemoryPersistence {
+    async fn try_sweep_lock(&self, _name: &str) -> Result<Option<Box<dyn SweepGuard>>> {
+        Ok(Some(Box::new(NoopSweepGuard)))
+    }
+}
+
+impl BackendCapabilities for InMemoryPersistence {
+    fn supports_distributed_coordination(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -872,5 +1066,212 @@ mod tests {
         let list = store.list_group_configs().await.unwrap();
         let g = list.iter().find(|r| r.name == "g1").unwrap();
         assert_eq!(g.default_tags["env"], "prod");
+    }
+
+    // -----------------------------------------------------------------------
+    // ConfigRevisionStore
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn config_revision_starts_at_zero() {
+        let store = InMemoryPersistence::new();
+        assert_eq!(store.current_revision().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn bump_revision_increments() {
+        let store = InMemoryPersistence::new();
+        let r1 = store.bump_revision().await.unwrap();
+        let r2 = store.bump_revision().await.unwrap();
+        let r3 = store.bump_revision().await.unwrap();
+        assert_eq!(r1, 1);
+        assert_eq!(r2, 2);
+        assert_eq!(r3, 3);
+        assert_eq!(store.current_revision().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn subscribe_revisions_returns_none_for_in_memory() {
+        let store = InMemoryPersistence::new();
+        let rx = store.subscribe_revisions().await.unwrap();
+        assert!(rx.is_none(), "InMemory has no push notifications");
+    }
+
+    // -----------------------------------------------------------------------
+    // CapacityStore
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn capacity_try_acquire_always_succeeds_in_memory() {
+        let store = InMemoryPersistence::new();
+        assert!(store
+            .try_acquire("cluster1", 1, "inst-1", "q-1")
+            .await
+            .unwrap());
+        assert!(store
+            .try_acquire("cluster1", 1, "inst-1", "q-2")
+            .await
+            .unwrap());
+        assert!(store
+            .try_acquire("cluster1", 1, "inst-2", "q-3")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn capacity_release_is_noop_in_memory() {
+        let store = InMemoryPersistence::new();
+        store.release("cluster1", "q-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn capacity_heartbeat_is_noop_in_memory() {
+        let store = InMemoryPersistence::new();
+        assert_eq!(store.heartbeat("inst-1").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn capacity_expire_stale_returns_zero() {
+        let store = InMemoryPersistence::new();
+        let expired = store.expire_stale(chrono::Utc::now()).await.unwrap();
+        assert_eq!(expired, 0);
+    }
+
+    #[tokio::test]
+    async fn capacity_active_count_returns_zero() {
+        let store = InMemoryPersistence::new();
+        assert_eq!(store.active_count("cluster1").await.unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // QueueCoordinator
+    // -----------------------------------------------------------------------
+
+    use queryflux_core::query::{ClusterGroupName, FrontendProtocol};
+    use queryflux_core::session::SessionContext;
+
+    fn make_queued(id: &str) -> QueuedQuery {
+        QueuedQuery {
+            id: ProxyQueryId(id.to_string()),
+            sql: "SELECT 1".to_string(),
+            session: SessionContext::default(),
+            frontend_protocol: FrontendProtocol::TrinoHttp,
+            cluster_group: ClusterGroupName("test".to_string()),
+            creation_time: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+            sequence: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_try_claim_returns_query_when_exists() {
+        let store = InMemoryPersistence::new();
+        store.upsert_queued(make_queued("q-1")).await.unwrap();
+
+        let claimed = store
+            .try_claim("q-1", "inst-1", chrono::Utc::now())
+            .await
+            .unwrap();
+        assert!(claimed.is_some());
+        assert_eq!(claimed.unwrap().id.0, "q-1");
+    }
+
+    #[tokio::test]
+    async fn queue_try_claim_returns_none_when_missing() {
+        let store = InMemoryPersistence::new();
+        let claimed = store
+            .try_claim("nonexistent", "inst-1", chrono::Utc::now())
+            .await
+            .unwrap();
+        assert!(claimed.is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_creation_time_preserved_on_requeue() {
+        let store = InMemoryPersistence::new();
+        let original = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let mut q = make_queued("q-ct");
+        q.creation_time = original;
+        store.upsert_queued(q).await.unwrap();
+
+        // Re-queue with a fresh creation_time, as persist_queued_query does.
+        store.upsert_queued(make_queued("q-ct")).await.unwrap();
+
+        let got = store
+            .get_queued(&ProxyQueryId("q-ct".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.creation_time, original);
+    }
+
+    #[tokio::test]
+    async fn count_active_queued_before_orders_and_filters() {
+        let store = InMemoryPersistence::new();
+        let now = chrono::Utc::now();
+        let active_after = now - chrono::Duration::seconds(15);
+
+        let mut q_old = make_queued("q-old");
+        q_old.creation_time = now - chrono::Duration::minutes(5);
+        let mut q_new = make_queued("q-new");
+        q_new.creation_time = now - chrono::Duration::seconds(2);
+        let mut q_dead = make_queued("q-dead");
+        q_dead.creation_time = now - chrono::Duration::minutes(20);
+        q_dead.last_accessed = now - chrono::Duration::minutes(10);
+        for q in [q_old, q_new, q_dead] {
+            store.upsert_queued(q).await.unwrap();
+        }
+
+        // Never-queued caller sees both live waiters; the dead client is excluded.
+        assert_eq!(
+            store
+                .count_active_queued_before("test", None, active_after)
+                .await
+                .unwrap(),
+            2
+        );
+        // The newer waiter sees only the older one ahead of it.
+        assert_eq!(
+            store
+                .count_active_queued_before(
+                    "test",
+                    Some(now - chrono::Duration::seconds(2)),
+                    active_after
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        // Other groups are unaffected.
+        assert_eq!(
+            store
+                .count_active_queued_before("other", None, active_after)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_release_claim_is_noop() {
+        let store = InMemoryPersistence::new();
+        store.release_claim("q-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_list_unclaimed_returns_all_queued() {
+        let store = InMemoryPersistence::new();
+        store.upsert_queued(make_queued("q-1")).await.unwrap();
+        store.upsert_queued(make_queued("q-2")).await.unwrap();
+
+        let unclaimed = store.list_unclaimed(chrono::Utc::now()).await.unwrap();
+        assert_eq!(unclaimed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn queue_list_unclaimed_empty_store() {
+        let store = InMemoryPersistence::new();
+        let unclaimed = store.list_unclaimed(chrono::Utc::now()).await.unwrap();
+        assert!(unclaimed.is_empty());
     }
 }

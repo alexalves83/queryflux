@@ -172,7 +172,10 @@ impl OidcAuthProvider {
     pub fn new(config: OidcConfig, required: bool) -> Self {
         Self {
             config,
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("build OIDC http client"),
             jwks_cache: Arc::new(RwLock::new(None)),
             required,
         }
