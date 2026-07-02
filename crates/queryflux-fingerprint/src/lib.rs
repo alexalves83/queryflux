@@ -8,10 +8,11 @@
 
 pub mod fallback;
 pub mod fast;
+pub mod polyglot_pool;
 pub mod rich;
 
 pub use fast::fast_hash;
-pub use rich::{rich_fingerprint, QueryFingerprint};
+pub use rich::{is_deterministic, rich_fingerprint, QueryFingerprint};
 
 /// Map a `SqlDialect` to the dialect name string polyglot-sql expects.
 /// Kept here — not in queryflux-core — because polyglot-sql is an implementation

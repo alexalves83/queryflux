@@ -76,6 +76,10 @@ pub struct QuerySummary {
     pub guard_actions: Option<serde_json::Value>,
     #[serde(default)]
     pub was_guard_blocked: bool,
+    /// True when the result was served from the query result cache.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub cache_hit: bool,
 }
 
 /// Aggregated stats for the last hour, shown on the dashboard.
