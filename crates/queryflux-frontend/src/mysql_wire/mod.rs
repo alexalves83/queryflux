@@ -594,14 +594,26 @@ async fn write_synthetic_multi_column_row<W: AsyncWriteExt + Unpin>(
 /// Each `on_*` call encodes one or more MySQL packets (4-byte header + payload)
 /// and sends them to an `UnboundedSender`. The COM_QUERY handler drains the
 /// receiver and writes them to the TCP stream, preserving O(1 batch) memory.
+#[derive(Debug, Clone, Copy)]
+enum ResponseMode {
+    None,
+    ResultSet,
+    Ok,
+}
+
 struct MysqlResultSink {
     tx: UnboundedSender<Vec<u8>>,
     seq: u8,
+    mode: ResponseMode,
 }
 
 impl MysqlResultSink {
     fn new(tx: UnboundedSender<Vec<u8>>, start_seq: u8) -> Self {
-        Self { tx, seq: start_seq }
+        Self {
+            tx,
+            seq: start_seq,
+            mode: ResponseMode::None,
+        }
     }
 
     /// Prepend a 4-byte MySQL packet header and send to the channel.
@@ -622,6 +634,13 @@ impl MysqlResultSink {
 #[async_trait]
 impl ResultSink for MysqlResultSink {
     async fn on_schema(&mut self, schema: &Schema) -> Result<()> {
+        if schema.fields().is_empty() {
+            self.mode = ResponseMode::Ok;
+            return Ok(());
+        }
+
+        self.mode = ResponseMode::ResultSet;
+
         // Column count packet.
         let mut count_pkt = Vec::new();
         write_lenenc_int(&mut count_pkt, schema.fields().len() as u64);
@@ -651,8 +670,18 @@ impl ResultSink for MysqlResultSink {
         Ok(())
     }
 
-    async fn on_complete(&mut self, _stats: &QueryStats) -> Result<()> {
-        self.encode_and_send(build_eof());
+    async fn on_complete(&mut self, stats: &QueryStats) -> Result<()> {
+        match self.mode {
+            ResponseMode::Ok => {
+                self.encode_and_send(build_ok(stats.rows_returned, 0));
+            }
+            ResponseMode::ResultSet => {
+                self.encode_and_send(build_eof());
+            }
+            ResponseMode::None => {
+                self.encode_and_send(build_ok(0, 0));
+            }
+        }
         Ok(())
     }
 
@@ -664,6 +693,8 @@ impl ResultSink for MysqlResultSink {
     async fn on_native_chunk(&mut self, chunk: &NativeResultChunk) -> Result<()> {
         // On the first chunk, send column count + column definition packets + EOF.
         if let Some(columns) = &chunk.columns {
+            self.mode = ResponseMode::ResultSet;
+
             let mut count_pkt = Vec::new();
             write_lenenc_int(&mut count_pkt, columns.len() as u64);
             self.encode_and_send(count_pkt);

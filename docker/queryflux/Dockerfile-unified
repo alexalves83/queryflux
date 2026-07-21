@@ -203,35 +203,3 @@ EXPOSE 3000 8080 9000
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint-unified.sh"]
 CMD ["--config", "/etc/queryflux/config.yaml"]
-
-# =============================================================================
-# Runtime: server only (default `docker build` final stage)
-# =============================================================================
-FROM runtime-server
-
-RUN apt-get update && apt-get install --no-install-recommends -y \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -u 1000 queryflux \
-    && mkdir -p /app \
-    && chown -R queryflux:queryflux /app
-
-COPY requirements.txt /tmp/requirements.txt
-RUN python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt && \
-    rm /tmp/requirements.txt
-
-COPY --from=builder /queryflux-binary /app/queryflux
-COPY --from=builder /queryflux-libduckdb.so /usr/local/lib/libduckdb.so
-COPY --from=adbc-drivers /root/.config/adbc/drivers/ /usr/local/lib/adbc/
-COPY docker/queryflux/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/queryflux /app/entrypoint.sh
-
-ENV LD_LIBRARY_PATH=/usr/local/lib
-ENV ADBC_DRIVER_PATH=/usr/local/lib/adbc
-ENV PYO3_PYTHON=/opt/venv/bin/python3
-WORKDIR /app
-USER queryflux
-
-ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["--config", "/etc/queryflux/config.yaml"]
